@@ -23,6 +23,7 @@ from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 from huggingface_hub import utils
 from torch import nn
 
+from nunchaku.models.unets.resblock import NunchakuSDXLResnetBlock2D
 from nunchaku.utils import get_precision
 
 from ..attention import NunchakuBaseAttention, _patch_linear
@@ -178,10 +179,10 @@ class NunchakuSDXLTransformerBlock(BasicTransformerBlock):
         self.only_cross_attention = block.only_cross_attention
 
         self.norm1 = block.norm1
-        self.norm2 = block.norm2
-        self.norm3 = block.norm3
         self.attn1 = NunchakuSDXLAttention(block.attn1, **kwargs)
+        self.norm2 = block.norm2
         self.attn2 = NunchakuSDXLAttention(block.attn2, **kwargs)
+        self.norm3 = block.norm3
         self.ff = NunchakuSDXLFeedForward(block.ff, **kwargs)
 
     def forward(
@@ -340,6 +341,64 @@ class NunchakuSDXLShiftedConv2d(nn.Module):
         return self.conv(input)
 
 
+def _least_multiple_of(orig_value: int, multiple: int):
+    return (orig_value + multiple - 1) // multiple * multiple
+
+
+class NunchakuConv2dAsLinear(nn.Module):
+
+    def __init__(self, orig_conv: nn.Conv2d, **kwargs):
+        super().__init__()
+        self.in_channels = orig_conv.in_channels
+        self.out_channels = orig_conv.out_channels
+        self.kernel_size = orig_conv.kernel_size
+        self.stride = orig_conv.stride
+        self.padding = orig_conv.padding
+        self.bias_flag = orig_conv.bias is not None
+
+        self.default_warp_n = 128
+        self.default_num_k_unrolls = 2
+        self.default_comp_k = 256 // 4
+        kH, kW = self.kernel_size
+        padded_in_features = _least_multiple_of(
+            orig_value=self.in_channels * kH * kW, multiple=self.default_comp_k * self.default_num_k_unrolls
+        )
+        padded_out_features = _least_multiple_of(orig_value=self.out_channels, multiple=self.default_warp_n)
+
+        self.linear = SVDQW4A4Linear(
+            in_features=padded_in_features * kH * kW,
+            out_features=padded_out_features,
+            bias=self.bias_flag,
+            torch_dtype=orig_conv.weight.dtype,
+            device=orig_conv.weight.device,
+            **kwargs,
+        )
+
+    def forward(self, x: torch.Tensor):
+        N, C, H, W = x.shape
+        x_unf = (
+            F.unfold(x, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        if self.linear.in_features > x_unf.shape[2]:
+            x_unf = F.pad(x_unf, (0, self.linear.in_features - x_unf.shape[2]), value=0)
+        """
+        unfold/transpose/contiguous/pad ops are too slow because of heavy memory allocation and access.
+        """
+
+        y = self.linear(x_unf)
+
+        if self.out_channels < y.shape[2]:
+            y = y[:, :, : self.out_channels - y.shape[2]]
+
+        H_out = (H + 2 * self.padding[0] - self.kernel_size[0]) // self.stride[0] + 1
+        W_out = (W + 2 * self.padding[1] - self.kernel_size[1]) // self.stride[1] + 1
+        y = y.transpose(1, 2).reshape(N, self.out_channels, H_out, W_out)
+
+        return y
+
+
 class NunchakuSDXLConcatShiftedConv2d(nn.Module):
     # Adapted from https://github.com/nunchaku-tech/deepcompressor/blob/main/deepcompressor/nn/patch/conv.py#ConcatConv2d
     def __init__(self, orig_conv: nn.Conv2d, split: int):
@@ -408,60 +467,37 @@ class NunchakuSDXLUNet2DConditionModel(UNet2DConditionModel, NunchakuModelLoader
                     nunchaku_sdxl_transformer_blocks.append(nunchaku_sdxl_transformer_block)
                 attn.transformer_blocks = nn.ModuleList(nunchaku_sdxl_transformer_blocks)
 
-        # _patch_resnets_convs is not used since the support from the inference engine is not completed.
         def _patch_resnets_convs(
             block: CrossAttnDownBlock2D | CrossAttnUpBlock2D | UNetMidBlock2DCrossAttn | UpBlock2D | DownBlock2D,
-            up_block_idx: int | None = None,
         ):
-            for resnet_idx, resnet in enumerate(block.resnets):
-                if isinstance(block, (CrossAttnUpBlock2D, UpBlock2D)):
-                    if resnet_idx == 0:
-                        if up_block_idx == 0:
-                            prev_block = self.mid_block
-                        else:
-                            prev_block = self.up_blocks[up_block_idx - 1]
-                        split = prev_block.resnets[-1].conv2.out_channels
-                    else:
-                        split = block.resnets[resnet_idx - 1].conv2.out_channels
-                    resnet.conv1 = NunchakuSDXLConcatShiftedConv2d(resnet.conv1, split)
-                else:
-                    resnet.conv1 = NunchakuSDXLShiftedConv2d(
-                        resnet.conv1.in_channels,
-                        resnet.conv1.out_channels,
-                        resnet.conv1.kernel_size,
-                        resnet.conv1.stride,
-                        resnet.conv1.padding,
-                        resnet.conv1.dilation,
-                        resnet.conv1.groups,
-                        #  orig_bias,
-                        resnet.conv1.padding_mode,
-                        resnet.conv1.weight.device,
-                        resnet.conv1.weight.dtype,
-                    )
-                resnet.conv2 = NunchakuSDXLShiftedConv2d(
-                    resnet.conv2.in_channels,
-                    resnet.conv2.out_channels,
-                    resnet.conv2.kernel_size,
-                    resnet.conv2.stride,
-                    resnet.conv2.padding,
-                    resnet.conv2.dilation,
-                    resnet.conv2.groups,
-                    #  orig_bias,
-                    resnet.conv2.padding_mode,
-                    resnet.conv2.weight.device,
-                    resnet.conv2.weight.dtype,
-                )
+            for resnet in block.resnets:
+                resnet.conv1 = NunchakuConv2dAsLinear(resnet.conv1, **kwargs)
+                resnet.conv2 = NunchakuConv2dAsLinear(resnet.conv2, **kwargs)
+
+        def _patch_resnets(
+            block: CrossAttnDownBlock2D | CrossAttnUpBlock2D | UNetMidBlock2DCrossAttn | UpBlock2D | DownBlock2D,
+        ):
+            _nunchaku_resnet_blocks = []
+            for resnet in block.resnets:
+                _nunchaku_resnet_blocks.append(NunchakuSDXLResnetBlock2D(resnet))
+            block.resnets = nn.ModuleList(_nunchaku_resnet_blocks)
 
         for _, down_block in enumerate(self.down_blocks):
             if isinstance(down_block, CrossAttnDownBlock2D):
                 _patch_attentions(down_block)
+            _patch_resnets_convs(down_block)
+            # _patch_resnets(down_block)
 
         for _, up_block in enumerate(self.up_blocks):
             if isinstance(up_block, CrossAttnUpBlock2D):
                 _patch_attentions(up_block)
+            _patch_resnets_convs(up_block)
+            # _patch_resnets(up_block)
 
         assert isinstance(self.mid_block, UNetMidBlock2DCrossAttn), "Only UNetMidBlock2DCrossAttn is supported"
         _patch_attentions(self.mid_block)
+        _patch_resnets_convs(self.mid_block)
+        # _patch_resnets(self.mid_block)
 
         return self
 
@@ -526,7 +562,7 @@ class NunchakuSDXLUNet2DConditionModel(UNet2DConditionModel, NunchakuModelLoader
 def convert_sdxl_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     new_state_dict = {}
     for k, v in state_dict.items():
-        if ".transformer_blocks." in k:
+        if ".transformer_blocks." in k or (".resnets." in k and ".conv" in k and ".linear" in k):
             if ".lora_down" in k:
                 new_k = k.replace(".lora_down", ".proj_down")
             elif ".lora_up" in k:

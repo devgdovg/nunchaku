@@ -137,7 +137,8 @@ def merge_safetensors(
     return state_dict, {
         "config": Path(config_path).read_text(),
         "comfy_config": Path(comfy_config_path).read_text(),
-        "model_class": "NunchakuFluxTransformer2dModel",
+        # "model_class": "NunchakuFluxTransformer2dModel",
+        "model_class": "NunchakuSDXLUNet2DConditionModel",
         "quantization_config": json.dumps(quantization_config),
     }
 
