@@ -218,3 +218,8 @@ dev/
 metrics.json
 *use_count.txt
 *use_record.txt
+
+tmp_logs/
+tmp_scripts/
+tmp_imgs/
+nunchaku-test-cache/
