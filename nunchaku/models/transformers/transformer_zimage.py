@@ -27,6 +27,9 @@ from .utils import NunchakuModelLoaderMixin, patch_scale_key
 
 
 class NunchakuZImageRopeHook:
+    """
+    Hook class for caching and substition of packed `freqs_cis` tensor.
+    """
 
     def __init__(self):
         self.packed_cache = {}
@@ -255,6 +258,11 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         f_patch_size=1,
         return_dict: bool = True,
     ):
+        """
+        Adapted from diffusers.models.transformers.transformer_z_image.ZImageTransformer2DModel#forward
+
+        Register pre-forward hooks for caching and substitution of packed `freqs_cis` tensor for all attention submodules and unregister after forwarding is done.
+        """
         rope_hook = NunchakuZImageRopeHook()
         self.register_rope_hook(rope_hook)
         try:
