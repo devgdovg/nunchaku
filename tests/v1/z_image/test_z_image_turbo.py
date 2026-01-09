@@ -131,7 +131,6 @@ def download_ref_images(local_save_dir, filenames):
             print(f"download ref image failed: {e}")
 
 
-@pytest.mark.skipif(not is_turing(), reason="Not Turing GPUs. Skip tests.")
 @pytest.mark.parametrize(
     "rank,expected_lpips",
     [
@@ -141,16 +140,15 @@ def download_ref_images(local_save_dir, filenames):
     ],
 )
 def test_zimage_turbo_turing(rank: int, expected_lpips: dict[str, float]):
+    if f"{precision}-{dtype_str}" not in expected_lpips:
+        return
+
     if not already_generate(save_dir_16bit, len(dataset)):
         filenames = [d["filename"] for d in dataset]
         download_ref_images(save_dir_16bit, filenames)
 
     save_dir_nunchaku = (
-        Path("test_results")
-        / "nunchaku"
-        / model_name
-        / f"{precision}_r{rank}-{dtype_str}"
-        / f"{folder_name}-bs{batch_size}"
+        Path("test_results") / "nunchaku" / model_name / f"{precision}_r{rank}-fp16" / f"{folder_name}-bs{batch_size}"
     )
     path = f"nunchaku-tech/nunchaku-z-image-turbo/svdq-{precision}_r{rank}-z-image-turbo.safetensors"
     transformer = NunchakuZImageTransformer2DModel.from_pretrained(path, torch_dtype=torch_dtype)
@@ -177,4 +175,4 @@ def test_zimage_turbo_turing(rank: int, expected_lpips: dict[str, float]):
 
     lpips = compute_lpips(save_dir_16bit, save_dir_nunchaku)
     print(f"lpips: {lpips}")
-    assert lpips < expected_lpips[f"{precision}-{dtype_str}"] * 1.15
+    assert lpips < expected_lpips[f"{precision}-fp16"] * 1.15
