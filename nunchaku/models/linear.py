@@ -120,8 +120,6 @@ class SVDQW4A4Linear(nn.Module):
 
         self.proj_down = nn.Parameter(torch.empty(in_features, rank, dtype=torch_dtype, device=device))
         self.proj_up = nn.Parameter(torch.empty(out_features, rank, dtype=torch_dtype, device=device))
-        # self.proj_down = nn.Parameter(torch.empty(in_features, rank, dtype=torch_dtype, device=device), requires_grad=False)
-        # self.proj_up = nn.Parameter(torch.empty(out_features, rank, dtype=torch_dtype, device=device), requires_grad=False)
 
         if precision == "nvfp4":
             self.wcscales = nn.Parameter(
