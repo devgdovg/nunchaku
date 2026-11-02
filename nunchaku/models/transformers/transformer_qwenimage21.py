@@ -31,6 +31,8 @@ from diffusers.models.transformers.transformer_qwenimage21 import (
 from huggingface_hub import utils
 from torch import nn
 
+from ...ops.gemm import svdq_gemm_w4a4_cuda
+from ...ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
 from ...utils import get_precision, pad_tensor
 from ..attention import NunchakuBaseAttention, NunchakuFeedForward
 from ..attention_processors.qwenimage21 import NunchakuQwenImage21AttnProcessor
@@ -41,6 +43,7 @@ from .utils import NunchakuModelLoaderMixin, patch_scale_key
 
 __all__ = [
     "NunchakuQwenImage21Attention",
+    "NunchakuQwenImage21FusedModule",
     "NunchakuQwenImage21RopeHook",
     "NunchakuQwenImage21Transformer2DModel",
 ]
@@ -103,6 +106,60 @@ class NunchakuQwenImage21RopeHook:
         return args, new_kwargs
 
 
+class NunchakuQwenImage21FusedModule(nn.Module):
+    """Group QKV and RMSNorm parameters into one module for sequential offload.
+
+    accelerate's ``enable_sequential_cpu_offload`` attaches hooks per submodule and
+    loads a submodule's parameters only when that submodule's forward is called.
+    The fused kernel reads ``qweight``/``wscales``/``proj_*`` and the two RMSNorm
+    weights directly, so they must all belong to one module whose forward the
+    attention processor actually invokes. This is the Qwen counterpart of
+    ``NunchakuZImageFusedModule``.
+    """
+
+    def __init__(self, qkv: SVDQW4A4Linear, norm_q: nn.Module, norm_k: nn.Module) -> None:
+        super().__init__()
+        for name, param in qkv.named_parameters(prefix="qkv_"):
+            setattr(self, name.replace(".", ""), param)
+        self.qkv_precision = qkv.precision
+        self.qkv_in_features = qkv.in_features
+        self.qkv_out_features = qkv.out_features
+        for name, param in norm_q.named_parameters(prefix="norm_q_"):
+            setattr(self, name.replace(".", ""), param)
+        for name, param in norm_k.named_parameters(prefix="norm_k_"):
+            setattr(self, name.replace(".", ""), param)
+
+    def forward(self, x: torch.Tensor, rotary_emb: torch.Tensor | None = None) -> torch.Tensor:
+        batch_size, seq_len, channels = x.shape
+        assert channels == self.qkv_in_features, f"QKV input channels {channels} != {self.qkv_in_features}"
+        x = x.view(batch_size * seq_len, channels)
+        quantized_x, ascales, lora_act_out = svdq_quantize_w4a4_act_fuse_lora_cuda(
+            x,
+            lora_down=self.qkv_proj_down,
+            smooth=self.qkv_smooth_factor,
+            fp4=self.qkv_precision == "nvfp4",
+            pad_size=256,
+        )
+        output = torch.empty(batch_size * seq_len, self.qkv_out_features, dtype=x.dtype, device=x.device)
+        svdq_gemm_w4a4_cuda(
+            act=quantized_x,
+            wgt=self.qkv_qweight,
+            out=output,
+            ascales=ascales,
+            wscales=self.qkv_wscales,
+            lora_act_in=lora_act_out,
+            lora_up=self.qkv_proj_up,
+            bias=getattr(self, "qkv_bias", None),
+            fp4=self.qkv_precision == "nvfp4",
+            alpha=1.0 if self.qkv_precision == "nvfp4" else None,
+            wcscales=getattr(self, "qkv_wcscales", None),
+            norm_q=self.norm_q_weight,
+            norm_k=self.norm_k_weight,
+            rotary_emb=rotary_emb,
+        )
+        return output.view(batch_size, seq_len, -1)
+
+
 class NunchakuQwenImage21Attention(NunchakuBaseAttention):
     """Qwen Image 2.1 attention with a quantized fused QKV projection."""
 
@@ -127,6 +184,20 @@ class NunchakuQwenImage21Attention(NunchakuBaseAttention):
 
     def forward(self, hidden_states: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         return self.processor(self, hidden_states, **kwargs)
+
+
+def _replace_qwen_fused_module(module: nn.Module, incompatible_keys: Any) -> None:
+    """Move QKV/QK-norm parameters into one module after the checkpoint is loaded.
+
+    The new module is the only ``nn.Module`` whose forward the processor calls for
+    the fused qkv path, so accelerate's per-submodule sequential offload hook sees
+    and moves all of ``qweight``/``wscales``/``proj_*``/``norm_*`` together.
+    """
+    assert isinstance(module, NunchakuQwenImage21Attention)
+    module.fused_module = NunchakuQwenImage21FusedModule(module.to_qkv, module.norm_q, module.norm_k)
+    del module.to_qkv
+    del module.norm_q
+    del module.norm_k
 
 
 def _convert_qwen_ff(ffn: nn.Module) -> FeedForward:
@@ -172,6 +243,7 @@ class NunchakuQwenImage21Transformer2DModel(QwenImage21Transformer2DModel, Nunch
                 rank=rank,
             )
             block.attn = NunchakuQwenImage21Attention(block.attn, precision=precision, rank=rank)
+            block.attn.register_load_state_dict_post_hook(_replace_qwen_fused_module)
             block.attn.register_forward_pre_hook(self._rope_hook, with_kwargs=True)
         return self
 
@@ -185,7 +257,9 @@ class NunchakuQwenImage21Transformer2DModel(QwenImage21Transformer2DModel, Nunch
         device = kwargs.get("device", "cpu")
         offload = kwargs.get("offload", False)
         if offload:
-            raise NotImplementedError("Offload is not supported for Qwen Image 2.1")
+            raise NotImplementedError(
+                "Custom block-level offload is not supported; use pipeline.enable_sequential_cpu_offload() instead"
+            )
 
         torch_dtype = kwargs.get("torch_dtype", torch.bfloat16)
         if isinstance(pretrained_model_name_or_path, str):

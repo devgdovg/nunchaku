@@ -103,16 +103,25 @@ def _generate_reference(name: str, dataset: list[dict], forward_kwargs: dict) ->
 
 def _run_nunchaku(name: str, dataset: list[dict], forward_kwargs: dict) -> Path:
     save_dir = _nunchaku_dir(name)
+    sequential_offload = os.environ.get("QWEN_IMAGE_21_SEQUENTIAL_OFFLOAD", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     transformer = NunchakuQwenImage21Transformer2DModel.from_pretrained(
         ckpt_path,
         torch_dtype=torch_dtype,
-        device="cuda",
+        device="cpu" if sequential_offload else "cuda",
     )
     pipe = QwenImage21Pipeline.from_pretrained(
         model_id,
         transformer=transformer,
         torch_dtype=torch_dtype,
-    ).to("cuda")
+    )
+    if sequential_offload:
+        pipe.enable_sequential_cpu_offload()
+    else:
+        pipe.to("cuda")
     run_pipeline(
         dataset=dataset,
         batch_size=1,

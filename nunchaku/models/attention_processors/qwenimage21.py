@@ -12,8 +12,6 @@ from typing import Any
 import torch
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 
-from ...ops.fused import fused_qkv_norm_rottary
-
 __all__ = ["NunchakuQwenImage21AttnProcessor"]
 
 
@@ -41,13 +39,7 @@ class NunchakuQwenImage21AttnProcessor:
         segments: list[tuple[int, int, bool]] | None = None,
         key_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        qkv = fused_qkv_norm_rottary(
-            hidden_states,
-            attn.to_qkv,
-            attn.norm_q,
-            attn.norm_k,
-            rotary_emb,
-        )
+        qkv = attn.fused_module(hidden_states, rotary_emb)
 
         query, key, value = qkv.chunk(3, dim=-1)
         query = query.unflatten(-1, (attn.heads, -1))
