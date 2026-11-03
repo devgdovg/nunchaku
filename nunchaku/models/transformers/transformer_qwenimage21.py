@@ -26,6 +26,7 @@ from diffusers.models.attention import FeedForward
 from diffusers.models.transformers.transformer_qwenimage21 import (
     QwenImage21Rope,
     QwenImage21SwiGLUFeedForward,
+    QwenImage21TemporalTimesteps,
     QwenImage21Transformer2DModel,
 )
 from huggingface_hub import utils
@@ -289,6 +290,14 @@ class NunchakuQwenImage21Transformer2DModel(QwenImage21Transformer2DModel, Nunch
         transformer.pos_embed = QwenImage21Rope(
             theta=int(config.get("rope_theta", 10000)),
             axes_dim=list(config.get("axes_dims_rope", [16, 56, 56])),
+        )
+        # `time_text_embed.time_proj.freqs` is a non-persistent buffer. It is not in
+        # the checkpoint and a meta-constructed model leaves it uninitialized after
+        # `to_empty`, producing NaN timestep embeddings. Rebuild it explicitly.
+        time_proj = transformer.time_text_embed.time_proj
+        transformer.time_text_embed.time_proj = QwenImage21TemporalTimesteps(
+            timestep_dim=time_proj.timestep_dim,
+            time_factor=time_proj.time_factor,
         )
 
         patch_scale_key(transformer, state_dict)
