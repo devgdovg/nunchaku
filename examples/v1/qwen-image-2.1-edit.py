@@ -31,27 +31,25 @@ if __name__ == "__main__":
         "change the text on the sign to read 'Qwen Image 2.1'",
     )
     output_path = os.environ.get("QWEN_IMAGE_21_EDIT_OUTPUT", "qwen-image-2.1-edit-nunchaku.png")
+    offload = os.environ.get("QWEN_IMAGE_21_OFFLOAD", "model").strip().lower()
     image = Image.open(edit_image_path).convert("RGB")
 
-    sequential_offload = os.environ.get("QWEN_IMAGE_21_SEQUENTIAL_OFFLOAD", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
     transformer = NunchakuQwenImage21Transformer2DModel.from_pretrained(
         ckpt_path,
         torch_dtype=torch.bfloat16,
-        device="cpu" if sequential_offload else "cuda",
+        device="cpu",
     )
     pipe = QwenImage21Pipeline.from_pretrained(
         model_path,
         transformer=transformer,
         torch_dtype=torch.bfloat16,
     )
-    if sequential_offload:
+    if offload == "sequential":
         pipe.enable_sequential_cpu_offload()
+    elif offload == "model":
+        pipe.enable_model_cpu_offload()
     else:
-        pipe.to("cuda")
+        raise ValueError("QWEN_IMAGE_21_OFFLOAD must be 'sequential' or 'model'")
 
     result = pipe(
         prompt=prompt,
