@@ -51,7 +51,7 @@ def _report(name: str, tensor: torch.Tensor) -> None:
         f"[BAD] {name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
         f"nan={torch.isnan(xf).sum().item()} inf={torch.isinf(xf).sum().item()} "
         f"finite_min={x.min().item():.6g} finite_max={x.max().item():.6g} "
-        f"finite_std={x.std().item():.6g}",
+        f"finite_std={x.std(unbiased=False).item():.6g}",
         flush=True,
     )
     if os.environ.get("QWEN_IMAGE_21_RAISE_ON_NAN", "0").strip().lower() in ("1", "true", "yes"):
@@ -76,7 +76,7 @@ def _log_stats(name: str, tensor: torch.Tensor) -> None:
     print(
         f"[stats] {name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
         f"nan={torch.isnan(xf).sum().item()} inf={torch.isinf(xf).sum().item()} "
-        f"min={x.min().item():.6g} max={x.max().item():.6g} std={x.std().item():.6g}",
+        f"min={x.min().item():.6g} max={x.max().item():.6g} std={x.std(unbiased=False).item():.6g}",
         flush=True,
     )
 
