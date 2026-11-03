@@ -155,6 +155,15 @@ if __name__ == "__main__":
         "yes",
     )
 
+    if num_steps < 2:
+        print(
+            "[warn] QwenImage21Pipeline with FlowMatchEulerDiscreteScheduler uses "
+            "sigmas=linspace(1, 1/num_steps, num_steps); num_steps=1 makes "
+            "stretch_shift_to_terminal divide by zero and produces NaN timesteps. "
+            "Use QWEN_IMAGE_21_STEPS>=2 for diagnostics.",
+            flush=True,
+        )
+
     print(
         f"[debug] model={model_path} ckpt={ckpt_path} steps={num_steps} "
         f"kv_cache={use_kv_cache} output_type={output_type} sequential_offload={sequential_offload}",
