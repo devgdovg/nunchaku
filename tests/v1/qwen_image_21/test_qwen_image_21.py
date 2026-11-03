@@ -101,6 +101,56 @@ def _generate_reference(name: str, dataset: list[dict], forward_kwargs: dict) ->
     return save_dir
 
 
+def _output_tensor(output):
+    if isinstance(output, (tuple, list)):
+        if not output:
+            return None
+        output = output[0]
+    sample = getattr(output, "sample", None)
+    if sample is not None:
+        output = sample
+    return output if torch.is_tensor(output) else None
+
+
+class _FiniteChecker:
+    """Record the first non-finite transformer/VAE output without noisy logging."""
+
+    def __init__(self, pipe) -> None:
+        self.bad = None
+        self.handles = []
+        targets = [("transformer", pipe.transformer), ("vae", pipe.vae)]
+        for index, block in enumerate(pipe.transformer.transformer_blocks):
+            targets.append((f"block[{index}]", block))
+            if hasattr(block.attn, "fused_module"):
+                targets.append((f"block[{index}].fused_qkv", block.attn.fused_module))
+        for name, module in targets:
+            if module is not None:
+                self.handles.append(module.register_forward_hook(self._hook(name)))
+
+    def _hook(self, name: str):
+        def hook(module, inputs, output) -> None:
+            if self.bad is not None:
+                return
+            tensor = _output_tensor(output)
+            if tensor is None or not tensor.is_floating_point():
+                return
+            finite = torch.isfinite(tensor)
+            if not finite.all():
+                self.bad = (
+                    name,
+                    int(torch.isnan(tensor).sum().item()),
+                    int(torch.isinf(tensor).sum().item()),
+                    tuple(tensor.shape),
+                )
+
+        return hook
+
+    def close(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+
 def _run_nunchaku(name: str, dataset: list[dict], forward_kwargs: dict) -> Path:
     save_dir = _nunchaku_dir(name)
     sequential_offload = os.environ.get("QWEN_IMAGE_21_SEQUENTIAL_OFFLOAD", "0").strip().lower() in (
@@ -113,6 +163,11 @@ def _run_nunchaku(name: str, dataset: list[dict], forward_kwargs: dict) -> Path:
         torch_dtype=torch_dtype,
         device="cpu" if sequential_offload else "cuda",
     )
+    assert torch.isfinite(transformer.time_text_embed.time_proj.freqs).all(), "time_proj.freqs is not initialized"
+    assert all(
+        torch.isfinite(freq.real).all() and torch.isfinite(freq.imag).all() for freq in transformer.pos_embed.freqs
+    ), "pos_embed.freqs is not initialized"
+
     pipe = QwenImage21Pipeline.from_pretrained(
         model_id,
         transformer=transformer,
@@ -122,13 +177,20 @@ def _run_nunchaku(name: str, dataset: list[dict], forward_kwargs: dict) -> Path:
         pipe.enable_sequential_cpu_offload()
     else:
         pipe.to("cuda")
-    run_pipeline(
-        dataset=dataset,
-        batch_size=1,
-        pipeline=pipe,
-        save_dir=save_dir,
-        forward_kwargs=forward_kwargs,
-    )
+
+    checker = _FiniteChecker(pipe)
+    try:
+        run_pipeline(
+            dataset=dataset,
+            batch_size=1,
+            pipeline=pipe,
+            save_dir=save_dir,
+            forward_kwargs=forward_kwargs,
+        )
+    finally:
+        checker.close()
+    assert checker.bad is None, f"non-finite output at {checker.bad}"
+
     del transformer
     del pipe
     gc.collect()
