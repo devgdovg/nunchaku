@@ -65,7 +65,7 @@ Options:
 - `--chunk-start` / `--chunk-step`: split the selected samples across processes or GPUs.
 - `--overwrite`: delete the existing manifest and regenerate the selected samples; use a fresh output root when changing inference parameters.
 
-Each run writes `{sample_id}.png` plus a `manifest.jsonl` that records the prompt, input images, ground-truth path, seed, step count, and precision. Existing samples are skipped on rerun, so interrupted runs can be resumed. A manifest generated with different inference settings (steps, CFG scale, KV cache, or precision) is rejected; use another output root or `--overwrite`.
+Each run writes `{sample_id}.png` plus a `manifest.jsonl` that records the prompt, input images, ground-truth path, seed, step count, precision, and the transformer actually used (`transformer_class`, `svdq_linears`). The `fp4` run aborts if the pipeline does not hold the nunchaku transformer or contains no `SVDQW4A4Linear` modules; the `bf16` run aborts if it unexpectedly contains quantized layers. Existing samples are skipped on rerun, so interrupted runs can be resumed. A manifest generated with different inference settings (steps, CFG scale, KV cache, or precision) is rejected; use another output root or `--overwrite`.
 
 ## Computing Metrics
 
@@ -107,6 +107,6 @@ The result JSON looks like:
 ## Notes
 
 - FID is sensitive to the number of images; with only a few dozen samples it is best treated as a trend indicator. `num_images` is recorded in the output.
-- Both pipelines must be run on the same dataset with the same `--max-samples` / `--sample-seed`. `get_metrics.py` checks that their manifests contain the same sample IDs.
+- Both pipelines must be run on the same dataset with the same `--max-samples` / `--sample-seed`. `get_metrics.py` checks that their manifests contain the same sample IDs and identical prompt/seed/steps/CFG/KV-cache settings.
 - The BF16 and FP4 runs are intentionally separate to keep VRAM usage low. A single run only holds one pipeline.
 - Text-to-image samples use `--width`/`--height` when provided; editing samples derive their output resolution from the input image.

@@ -83,7 +83,11 @@ def main() -> None:
     if args.chunk_step > 1:
         samples = samples[args.chunk_start :: args.chunk_step]
 
-    pipeline = build_pipeline(args.precision, args.model, args.ckpt, args.offload)
+    pipeline, transformer_info = build_pipeline(args.precision, args.model, args.ckpt, args.offload)
+    print(
+        f"[{args.precision}] transformer={transformer_info['transformer_class']} "
+        f"svdq_linears={transformer_info['svdq_linears']}"
+    )
     pipeline.set_progress_bar_config(desc="Sampling", leave=False, dynamic_ncols=True, position=1)
 
     for sample in tqdm(samples, desc="Samples", dynamic_ncols=True):
@@ -120,6 +124,8 @@ def main() -> None:
                 "true_cfg_scale": args.true_cfg_scale,
                 "use_kv_cache": args.use_kv_cache,
                 "precision": args.precision,
+                "transformer_class": transformer_info["transformer_class"],
+                "svdq_linears": transformer_info["svdq_linears"],
             },
         )
 

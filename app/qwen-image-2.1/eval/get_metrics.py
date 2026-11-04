@@ -80,6 +80,17 @@ def _check_same_samples(gen_manifest: dict, ref_manifest: dict, gen_root: str, r
             f"examples: {missing_in_ref[:3]} / {missing_in_gen[:3]}"
         )
 
+    fields = ("prompt", "seed", "num_inference_steps", "true_cfg_scale", "use_kv_cache", "width", "height", "images")
+    for sample_id in sorted(gen_ids):
+        gen_entry, ref_entry = gen_manifest[sample_id], ref_manifest[sample_id]
+        mismatched = {
+            key: (gen_entry.get(key), ref_entry.get(key)) for key in fields if gen_entry.get(key) != ref_entry.get(key)
+        }
+        if mismatched:
+            raise ValueError(
+                f"{sample_id}: generation settings differ between {gen_root!r} and {ref_root!r}: {mismatched}"
+            )
+
 
 def main() -> None:
     args = get_args()

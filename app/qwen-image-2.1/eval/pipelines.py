@@ -18,13 +18,29 @@ def sample_seed(sample_id: str) -> int:
     return hash_int
 
 
+def _transformer_info(transformer) -> dict[str, tp.Any]:
+    """识别实际参与推理的 transformer 类型与量化线性层数量。
+
+    按类名匹配 ``SVDQW4A4Linear``，避免在纯 bf16 评估时触发 nunchaku 编译扩展的导入。
+    """
+    return {
+        "transformer_class": type(transformer).__name__,
+        "svdq_linears": sum(type(module).__name__ == "SVDQW4A4Linear" for module in transformer.modules()),
+    }
+
+
 def build_pipeline(
     precision: str,
     model_path: str,
     ckpt_path: str | None = None,
     offload: str = "model",
-):
-    """构建原版 bf16 pipeline 或替换 SVDQ transformer 的 fp4 pipeline。"""
+) -> tuple[tp.Any, dict[str, tp.Any]]:
+    """构建原版 bf16 pipeline 或替换 SVDQ transformer 的 fp4 pipeline。
+
+    Returns:
+        ``(pipeline, info)``；``info`` 记录实际 transformer 的类名和 SVDQ 线性层数量，
+        用于确认量化/原版模型确实被正确替换。
+    """
     from diffusers import QwenImage21Pipeline
 
     kwargs: dict[str, tp.Any] = {"torch_dtype": torch.bfloat16}
@@ -44,13 +60,28 @@ def build_pipeline(
         raise ValueError(f"unsupported precision {precision!r} (expected 'bf16' or 'fp4')")
 
     pipeline = QwenImage21Pipeline.from_pretrained(model_path, **kwargs)
+    info = _transformer_info(pipeline.transformer)
+    expected_class = "NunchakuQwenImage21Transformer2DModel" if precision == "fp4" else "QwenImage21Transformer2DModel"
+    if info["transformer_class"] != expected_class:
+        raise RuntimeError(
+            f"pipeline uses transformer {info['transformer_class']!r}, "
+            f"expected {expected_class!r} for precision {precision!r}"
+        )
+    if precision == "fp4":
+        if kwargs["transformer"] is not pipeline.transformer:
+            raise RuntimeError("pipeline did not keep the quantized transformer instance")
+        if info["svdq_linears"] == 0:
+            raise RuntimeError("quantized transformer contains no SVDQW4A4Linear modules")
+    elif info["svdq_linears"] != 0:
+        raise RuntimeError(f"bf16 pipeline unexpectedly contains {info['svdq_linears']} SVDQW4A4Linear modules")
+
     if offload == "model":
         pipeline.enable_model_cpu_offload()
     elif offload == "sequential":
         pipeline.enable_sequential_cpu_offload()
     else:
         raise ValueError(f"unsupported offload mode {offload!r} (expected 'model' or 'sequential')")
-    return pipeline
+    return pipeline, info
 
 
 def build_call_kwargs(
