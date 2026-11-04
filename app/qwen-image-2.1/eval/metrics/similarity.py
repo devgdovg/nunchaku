@@ -57,19 +57,21 @@ def compute_similarity(
     ref_dir: str,
     sample_ids: tp.Sequence[str],
     metrics: tp.Sequence[str] = _METRIC_NAMES,
-    batch_size: int = 64,
     num_workers: int = 8,
     device: str | tp.Any = "cuda",
 ) -> dict[str, float]:
-    """计算 ``gen_dir`` 相对 ``ref_dir`` 的 LPIPS / PSNR。"""
+    """计算 ``gen_dir`` 相对 ``ref_dir`` 的 LPIPS / PSNR。
+
+    Text-to-image and editing samples (and editing inputs with different aspect
+    ratios) produce images of different sizes, so they cannot be stacked into a
+    batch. Each pair is therefore loaded and measured one at a time.
+    """
     if len(metrics) == 0:
         return {}
 
     metric_objects = {name: _build_metric(name, device) for name in metrics}
     dataset = PairedImageDataset(gen_dir, ref_dir, sample_ids)
-    dataloader = data.DataLoader(
-        dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False, drop_last=False
-    )
+    dataloader = data.DataLoader(dataset, batch_size=1, num_workers=num_workers, shuffle=False, drop_last=False)
     with torch.no_grad():
         for gen_tensor, ref_tensor in tqdm(dataloader, desc="Similarity metrics", dynamic_ncols=True):
             gen_tensor = gen_tensor.to(device)
