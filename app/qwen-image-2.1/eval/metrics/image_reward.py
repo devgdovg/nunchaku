@@ -12,8 +12,8 @@ __all__ = ["compute_image_reward"]
 def compute_image_reward(
     gen_dir: str,
     manifest: dict[str, dict[str, tp.Any]],
-    local_model_file: str = None,
-    local_config_file: str = None
+    local_model_file: str | None = None,
+    local_config_file: str | None = None,
 ) -> float:
     """对 manifest 中的每个样本计算 Image Reward，返回均值。"""
     import ImageReward as RM

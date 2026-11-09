@@ -146,7 +146,9 @@ def main() -> None:
                     cache_dir=args.fid_cache_dir,
                 )
             if "image_reward" in selected:
-                entry["image_reward"] = compute_image_reward(root, manifest, args.image_reward_model, args.image_reward_config)
+                entry["image_reward"] = compute_image_reward(
+                    root, manifest, args.image_reward_model, args.image_reward_config
+                )
             results[name] = entry
             print(name, json.dumps(entry, sort_keys=True))
 
