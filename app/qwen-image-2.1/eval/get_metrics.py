@@ -44,6 +44,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=8, help="DataLoader/FID worker count")
     parser.add_argument("--fid-batch-size", type=int, default=64, help="FID feature extraction batch size")
     parser.add_argument("--fid-cache-dir", default=None, help="Optional directory for cached FID features")
+    parser.add_argument("--image-reward-model", default=None, help="Local file path for image reward model")
+    parser.add_argument("--image-reward-config", default=None, help="Local file path for image reward config")
     return parser.parse_args()
 
 
@@ -144,7 +146,7 @@ def main() -> None:
                     cache_dir=args.fid_cache_dir,
                 )
             if "image_reward" in selected:
-                entry["image_reward"] = compute_image_reward(root, manifest)
+                entry["image_reward"] = compute_image_reward(root, manifest, args.image_reward_model, args.image_reward_config)
             results[name] = entry
             print(name, json.dumps(entry, sort_keys=True))
 

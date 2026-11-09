@@ -34,6 +34,7 @@ def build_pipeline(
     model_path: str,
     ckpt_path: str | None = None,
     offload: str = "model",
+    local_files_only: bool = True,
 ) -> tuple[tp.Any, dict[str, tp.Any]]:
     """构建原版 bf16 pipeline 或替换 SVDQ transformer 的 fp4 pipeline。
 
@@ -43,7 +44,7 @@ def build_pipeline(
     """
     from diffusers import QwenImage21Pipeline
 
-    kwargs: dict[str, tp.Any] = {"torch_dtype": torch.bfloat16}
+    kwargs: dict[str, tp.Any] = {"torch_dtype": torch.bfloat16, "local_files_only": local_files_only}
     if precision == "fp4":
         if not ckpt_path or not os.path.isfile(ckpt_path):
             raise ValueError("--ckpt must point to an existing quantized safetensors file when --precision fp4")

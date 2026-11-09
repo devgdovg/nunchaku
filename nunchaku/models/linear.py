@@ -149,13 +149,19 @@ class SVDQW4A4Linear(nn.Module):
         SVDQW4A4Linear
         """
         in_features = kwargs.pop("in_features", linear.in_features)
-        torch_dtype = kwargs.pop("torch_dtype", linear.weight.dtype)
+        if "torch_dtype" in kwargs:
+            torch_dtype = kwargs.pop("torch_dtype")
+        elif linear.weight is not None:
+            torch_dtype = linear.weight.dtype
+        else:
+            raise ValueError("no valid torch_dtype for SVDQW4A4Linear")
+        device = None if linear.weight is None else linear.weight.device
         return cls(
             in_features=in_features,
             out_features=linear.out_features,
             bias=linear.bias is not None,
             torch_dtype=torch_dtype,
-            device=linear.weight.device,
+            device=device,
             **kwargs,
         )
 
