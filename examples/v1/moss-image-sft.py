@@ -45,12 +45,12 @@ def _load_pipeline(transformer=None):
             print(f"warning: custom pipeline rejected the transformer override ({exc}); loading then replacing it")
             kwargs.pop("transformer")
             pipe = DiffusionPipeline.from_pretrained(model_path, **kwargs)
-            pipe.transformer = transformer
+            pipe.register_modules(transformer=transformer)
     else:
         pipe = DiffusionPipeline.from_pretrained(model_path, **kwargs)
     if transformer is not None and pipe.transformer is not transformer:
         print("warning: pipeline did not keep the passed transformer; replacing it")
-        pipe.transformer = transformer
+        pipe.register_modules(transformer=transformer)
     pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config)
     pipe.enable_model_cpu_offload()
     return pipe
