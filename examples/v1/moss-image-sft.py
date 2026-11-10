@@ -22,7 +22,6 @@ from diffusers import DiffusionPipeline
 
 from nunchaku import NunchakuMOSSImageTransformer
 from nunchaku.models.transformers.moss_image_lora import merge_moss_image_lora
-from nunchaku.models.transformers.transformer_mossimage import load_bf16_text_embedder
 from nunchaku.utils import get_precision
 
 
@@ -102,15 +101,8 @@ if __name__ == "__main__":
     guidance_scale = float(os.environ.get("MOSS_IMAGE_GUIDANCE", "1.0"))
     seed = int(os.environ.get("MOSS_IMAGE_SEED", "42"))
     strength = float(os.environ.get("MOSS_IMAGE_LORA_STRENGTH", "0.7"))
-    # DIAGNOSTIC ONLY: bf16 keeps text_embedder on the original bf16 weights/forward
-    # while the 42 main blocks stay quantized. Remove this mode once the text-block
-    # quantization impact has been diagnosed.
-    text_blocks = os.environ.get("MOSS_IMAGE_TEXT_BLOCKS", "quantized").strip().lower()
-    if text_blocks not in ("quantized", "bf16"):
-        raise ValueError("MOSS_IMAGE_TEXT_BLOCKS must be 'quantized' or 'bf16'")
     bf16_output = os.environ.get("MOSS_IMAGE_BF16_OUTPUT", "moss-image-sft-bf16-lora.png")
-    default_fp4_output = "moss-image-sft-fp4-text-bf16.png" if text_blocks == "bf16" else "moss-image-sft-fp4.png"
-    fp4_output = os.environ.get("MOSS_IMAGE_FP4_OUTPUT", default_fp4_output)
+    fp4_output = os.environ.get("MOSS_IMAGE_FP4_OUTPUT", "moss-image-sft-fp4.png")
 
     # 1) bf16 baseline: explicitly merge the DMD LoRA into the official transformer.
     pipe = _load_pipeline()
@@ -127,13 +119,6 @@ if __name__ == "__main__":
         torch_dtype=torch.bfloat16,
         device="cpu",
     )
-    if text_blocks == "bf16":
-        # DIAGNOSTIC ONLY: replace the quantized text blocks with the original
-        # bf16 text_embedder (weights + forward), leaving the 42 main blocks quantized.
-        if not os.path.isdir(model_path):
-            raise ValueError("MOSS_IMAGE_TEXT_BLOCKS=bf16 requires a local MOSS_IMAGE_MODEL directory")
-        transformer.text_embedder = load_bf16_text_embedder(model_path, transformer.config, dtype=torch.bfloat16)
-        print("diagnostic: text_embedder uses original bf16 weights/forward; main blocks remain quantized")
     pipe = _load_pipeline(transformer=transformer)
     print(f"quantized pipeline: transformer={type(pipe.transformer).__name__}")
     fp4_image = _generate(pipe, prompt, height, width, steps, guidance_scale, seed)
