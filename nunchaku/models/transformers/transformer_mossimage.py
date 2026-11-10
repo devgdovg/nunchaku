@@ -7,6 +7,7 @@ qkv/proj/ffn_up_gate/ffn_down 已融合并量化；这里只把对应线性层�
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from huggingface_hub import utils
+from safetensors import safe_open
 from torch import nn
 from torch.nn import functional as F
 
@@ -25,7 +27,7 @@ from ..linear import SVDQW4A4Linear
 from ..utils import fuse_linears
 from .utils import NunchakuModelLoaderMixin, patch_scale_key
 
-__all__ = ["NunchakuMOSSImageTransformer"]
+__all__ = ["NunchakuMOSSImageTransformer", "load_bf16_text_embedder"]
 
 
 class _RMSNorm(nn.Module):
@@ -334,3 +336,77 @@ class NunchakuMOSSImageTransformer(MOSSImageTransformer, NunchakuModelLoaderMixi
         patch_scale_key(transformer, state_dict)
         transformer.load_state_dict(state_dict)
         return transformer.eval()
+
+
+# ---------------------------------------------------------------------------
+# DIAGNOSTIC ONLY:
+# 用于定位 text block 量化（含 bias）对生成结果的影响。仅读取原版 bf16
+# transformer 的 text_embedder.* 权重，不加载 5B 主干；确认问题后可移除本函数
+# 以及 example 中对应的 MOSS_IMAGE_TEXT_BLOCKS=bf16 分支。
+# ---------------------------------------------------------------------------
+_TEXT_EMBEDDER_PREFIX = "text_embedder."
+
+
+def _read_text_embedder_state(transformer_dir: str, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    index_candidates = (
+        "diffusion_pytorch_model.safetensors.index.json",
+        "model.safetensors.index.json",
+    )
+    index_path = next(
+        (
+            os.path.join(transformer_dir, n)
+            for n in index_candidates
+            if os.path.isfile(os.path.join(transformer_dir, n))
+        ),
+        None,
+    )
+    if index_path is None:
+        matches = sorted(glob.glob(os.path.join(transformer_dir, "*.safetensors.index.json")))
+        index_path = matches[0] if len(matches) == 1 else None
+
+    state: dict[str, torch.Tensor] = {}
+    if index_path is not None:
+        with open(index_path) as f:
+            weight_map: dict[str, str] = json.load(f)["weight_map"]
+        keys_by_shard: dict[str, list[str]] = {}
+        for key, shard in weight_map.items():
+            if key.startswith(_TEXT_EMBEDDER_PREFIX):
+                keys_by_shard.setdefault(shard, []).append(key)
+        for shard, keys in keys_by_shard.items():
+            with safe_open(os.path.join(transformer_dir, shard), framework="pt", device="cpu") as f:
+                for key in keys:
+                    state[key[len(_TEXT_EMBEDDER_PREFIX) :]] = f.get_tensor(key).to(dtype=dtype)
+    else:
+        files = sorted(glob.glob(os.path.join(transformer_dir, "*.safetensors")))
+        if not files:
+            raise FileNotFoundError(f"no safetensors found under {transformer_dir!r}")
+        for path in files:
+            with safe_open(path, framework="pt", device="cpu") as f:
+                for key in f.keys():  # noqa: SIM118 - safetensors safe_open is not iterable
+                    if key.startswith(_TEXT_EMBEDDER_PREFIX):
+                        state[key[len(_TEXT_EMBEDDER_PREFIX) :]] = f.get_tensor(key).to(dtype=dtype)
+
+    if not state:
+        raise ValueError(f"no {_TEXT_EMBEDDER_PREFIX}* weights found under {transformer_dir!r}")
+    return state
+
+
+def load_bf16_text_embedder(model_root: str, config: Any, dtype: torch.dtype = torch.bfloat16) -> _TextProjection:
+    """DIAGNOSTIC ONLY: 从原版模型的 transformer/ 读取 bf16 text_embedder。
+
+    主 transformer 层的量化权重仍来自 svdq ckpt；这里仅用于对比 text block
+    量化（含 bias）对输出的影响，不参与正常量化推理路径。text block 使用本文件中
+    与官方逐操作同构的 ``_TextBlock.forward``。
+    """
+    transformer_dir = os.path.join(model_root, "transformer")
+    if not os.path.isdir(transformer_dir):
+        raise ValueError(f"MOSS_IMAGE_TEXT_BLOCKS=bf16 需要本地模型目录，找不到 {transformer_dir!r}")
+    state = _read_text_embedder_state(transformer_dir, dtype)
+    text_embedder = _TextProjection(
+        int(config.text_dim),
+        int(config.dim),
+        int(config.ffn_dim),
+        int(config.num_heads),
+    )
+    text_embedder.load_state_dict(state, strict=True)
+    return text_embedder.to(dtype=dtype).eval()
