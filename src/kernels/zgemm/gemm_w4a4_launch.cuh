@@ -47,7 +47,8 @@ public:
                           Tensor out_q,    // packed attention [B, H, M, D]
                           Tensor out_k,    // packed attention [B, H, M, D]
                           Tensor out_v,    // packed attention [B, H, M, D]
-                          int attn_tokens);
+                          int attn_tokens,
+                          int rope_mode = 0);
     static void quantize_w4a4_act_fuse_lora(Tensor input,
                                             Tensor output,
                                             Tensor oscales,
