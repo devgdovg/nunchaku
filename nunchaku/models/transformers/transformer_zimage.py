@@ -340,6 +340,7 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         patch_size=2,
         f_patch_size=1,
         return_dict: bool = True,
+        **kwargs,
     ):
         """
         Adapted from diffusers.models.transformers.transformer_z_image.ZImageTransformer2DModel#forward
@@ -349,7 +350,14 @@ class NunchakuZImageTransformer2DModel(ZImageTransformer2DModel, NunchakuModelLo
         rope_hook = NunchakuZImageRopeHook()
         self.register_rope_hook(rope_hook)
         try:
-            return super().forward(x, t, cap_feats, patch_size, f_patch_size, return_dict)
+            return super().forward(
+                x,
+                t,
+                cap_feats,
+                patch_size=patch_size,
+                f_patch_size=f_patch_size,
+                return_dict=return_dict,
+                **kwargs)
         finally:
             self.unregister_rope_hook()
             del rope_hook
