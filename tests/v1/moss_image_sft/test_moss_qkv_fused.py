@@ -44,11 +44,12 @@ def test_qkv_fused_matches_eager():
     block = transformer.layers[0]
     heads = transformer.config.num_heads
     dim = transformer.config.dim
+    head_dim = dim // heads
 
     y = torch.randn(1, seq_len, dim, device="cuda", dtype=torch.bfloat16)
     # Simple stage-1 layout: first half sin, second half cos, already padded to 256.
-    sin = torch.rand(1, seq_len, dim // 2, device="cuda", dtype=torch.float32)
-    cos = torch.rand(1, seq_len, dim // 2, device="cuda", dtype=torch.float32)
+    sin = torch.rand(1, seq_len, head_dim // 2, device="cuda", dtype=torch.float32)
+    cos = torch.rand(1, seq_len, head_dim // 2, device="cuda", dtype=torch.float32)
     rope = torch.cat((sin, cos), dim=-1)
 
     with torch.no_grad():
@@ -60,8 +61,8 @@ def test_qkv_fused_matches_eager():
 
     # _qkv_eager applies q/k RMSNorm but not RoPE; _qkv_fused applies both.
     rope_eager = rope.to(dtype=y.dtype)
-    qe = _rotate(qe.reshape(1, seq_len, heads, dim // heads), rope_eager).flatten(2)
-    ke = _rotate(ke.reshape(1, seq_len, heads, dim // heads), rope_eager).flatten(2)
+    qe = _rotate(qe.reshape(1, seq_len, heads, head_dim), rope_eager).flatten(2)
+    ke = _rotate(ke.reshape(1, seq_len, heads, head_dim), rope_eager).flatten(2)
 
     def _diff(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
         diff = (actual.float() - expected.float()).abs()
