@@ -353,7 +353,7 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
         assert(rotary_emb.ndims() == 3);
         assert(rotary_emb.shape[0] * rotary_emb.shape[1] == M);
         assert(rotary_emb.shape[2] == Epilogues::EpilogueRMSNormRope::HEAD_DIM);
-        assert(rope_mode == 0 || rope_mode == 1);
+        assert(rope_mode == 0 || rope_mode == 1 || rope_mode == 2);
 
         if (rope_mode == 0) {
             using EpilogueRope = typename Epilogues::EpilogueRMSNormRope;
@@ -396,22 +396,41 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
         } else {
             // Half-split RoPE currently supports only the standard `out` path.
             assert(!out_q.valid() && !out_k.valid() && !out_v.valid());
-            using EpilogueRope = typename Epilogues::EpilogueRMSNormRopeHalfSplit;
-            auto argsRope      = typename EpilogueRope::Arguments{
-                     .rotary_emb       = rotary_emb.data_ptr<typename EpilogueRope::packed_rotemb_t>(),
-                     .rmsnorm_weight_q = norm_q.data_ptr<half_t>(),
-                     .rmsnorm_weight_k = norm_k.data_ptr<half_t>(),
-                     .epsilon          = 1e-6,
-            };
-            launch_lora.template operator()<
-                typename GEMM::EpilogueCombination<EpilogueRope, typename GEMM::EpilogueDefault>,
-                typename GEMM::EpilogueNop>({argsRope,
-                                             typename GEMM::EpilogueDefault::Arguments{
-                                                 .out     = out.data_ptr<half_t>(),
-                                                 .actualM = actualM,
-                                                 .actualN = actualN,
-                                             }},
-                                            {});
+            if (rope_mode == 1) {
+                using EpilogueRope = typename Epilogues::EpilogueRMSNormRopeHalfSplit;
+                auto argsRope      = typename EpilogueRope::Arguments{
+                         .rotary_emb       = rotary_emb.data_ptr<typename EpilogueRope::packed_rotemb_t>(),
+                         .rmsnorm_weight_q = norm_q.data_ptr<half_t>(),
+                         .rmsnorm_weight_k = norm_k.data_ptr<half_t>(),
+                         .epsilon          = 1e-6,
+                };
+                launch_lora.template operator()<
+                    typename GEMM::EpilogueCombination<EpilogueRope, typename GEMM::EpilogueDefault>,
+                    typename GEMM::EpilogueNop>({argsRope,
+                                                 typename GEMM::EpilogueDefault::Arguments{
+                                                     .out     = out.data_ptr<half_t>(),
+                                                     .actualM = actualM,
+                                                     .actualN = actualN,
+                                                 }},
+                                                {});
+            } else {
+                using EpilogueRope = typename Epilogues::EpilogueRMSNormRopeHalfSplitPacked;
+                auto argsRope      = typename EpilogueRope::Arguments{
+                         .rotary_emb       = rotary_emb.data_ptr<typename EpilogueRope::packed_rotemb_t>(),
+                         .rmsnorm_weight_q = norm_q.data_ptr<half_t>(),
+                         .rmsnorm_weight_k = norm_k.data_ptr<half_t>(),
+                         .epsilon          = 1e-6,
+                };
+                launch_lora.template operator()<
+                    typename GEMM::EpilogueCombination<EpilogueRope, typename GEMM::EpilogueDefault>,
+                    typename GEMM::EpilogueNop>({argsRope,
+                                                 typename GEMM::EpilogueDefault::Arguments{
+                                                     .out     = out.data_ptr<half_t>(),
+                                                     .actualM = actualM,
+                                                     .actualN = actualN,
+                                                 }},
+                                                {});
+            }
         }
 
     } else if (out.valid()) {

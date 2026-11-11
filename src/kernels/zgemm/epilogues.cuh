@@ -424,13 +424,17 @@ public:
         }
     };
 
-    struct EpilogueRMSNormRopeHalfSplit {
+    template<bool PACKED>
+    struct EpilogueRMSNormRopeHalfSplitImpl {
         static constexpr int HEAD_DIM              = EpilogueRMSNormRope::HEAD_DIM;
         static constexpr int NUM_HEADS_PER_WARP    = EpilogueRMSNormRope::NUM_HEADS_PER_WARP;
         static constexpr int WARP_N_TILES_PER_HEAD = EpilogueRMSNormRope::WARP_N_TILES_PER_HEAD;
+        static constexpr int WARP_N_ROTEMB_TILES   = EpilogueRMSNormRope::WARP_N_ROTEMB_TILES;
 
-        // Stage-1 layout: [M, HEAD_DIM] float32, first HEAD_DIM/2 = sin, second = cos.
-        using packed_rotemb_t = float;
+        // PACKED: MMA/lane-aligned float4 layout from pack_rotemb_for_half_split.
+        // Simple: [M, HEAD_DIM] float32, first HEAD_DIM/2 = sin, second = cos.
+        using packed_rotemb_t = std::conditional_t<PACKED, float4, float>;
+        using rotemb_warp     = EpilogueRMSNormRope::rotemb_warp;
 
         struct Arguments {
             const packed_rotemb_t *rotary_emb;
@@ -486,6 +490,11 @@ public:
                 y = ix * sin + iy * cos;
             };
 
+            rotemb_warp rotemb{};
+            if constexpr (PACKED) {
+                rotemb = EpilogueRMSNormRope::load_rotemb(ptr_rotemb);
+            }
+
 #pragma unroll
             for (int head = 0; head < NUM_HEADS_PER_WARP; head++) {
                 const int n_offset = head * WARP_N_TILES_PER_HEAD;
@@ -522,25 +531,45 @@ public:
                         hi.data[6] *= rmsnorm_coef[head][m][1] * rms_hi.data[6];
                         hi.data[7] *= rmsnorm_coef[head][m][1] * rms_hi.data[7];
 
-                        const int row        = laneId / 4;
-                        const int col        = (laneId % 4) * 2;
-                        const int token      = warpId * WARP_M + m * INSN_M + row;
-                        const int angle_base = head * HEAD_DIM + n * INSN_N + col;
-                        const float *rope_lo = ptr_rotemb + token * HEAD_DIM;
-                        const float *rope_hi = ptr_rotemb + (token + 8) * HEAD_DIM;
+                        if constexpr (PACKED) {
+                            // Four float4 slots per tile n. Slots 0/1 are angles
+                            // j/j+1; slots 2/3 are angles j+8/j+9. Each slot
+                            // holds the token and token+8 rows in x/y and z/w.
+                            const packed_rotemb_t s0 = rotemb[m * WARP_N_ROTEMB_TILES + n * 4 + 0];
+                            const packed_rotemb_t s1 = rotemb[m * WARP_N_ROTEMB_TILES + n * 4 + 1];
+                            const packed_rotemb_t s2 = rotemb[m * WARP_N_ROTEMB_TILES + n * 4 + 2];
+                            const packed_rotemb_t s3 = rotemb[m * WARP_N_ROTEMB_TILES + n * 4 + 3];
 
-                        auto apply_pair = [&](int index, int angle, const float *rope_ptr) ALWAYSINLINE {
-                            apply_rope(lo.data[index], hi.data[index], rope_ptr[angle], rope_ptr[angle + HEAD_DIM / 2]);
-                        };
+                            apply_rope(lo.data[0], hi.data[0], s0.x, s0.y);
+                            apply_rope(lo.data[1], hi.data[1], s1.x, s1.y);
+                            apply_rope(lo.data[2], hi.data[2], s0.z, s0.w);
+                            apply_rope(lo.data[3], hi.data[3], s1.z, s1.w);
+                            apply_rope(lo.data[4], hi.data[4], s2.x, s2.y);
+                            apply_rope(lo.data[5], hi.data[5], s3.x, s3.y);
+                            apply_rope(lo.data[6], hi.data[6], s2.z, s2.w);
+                            apply_rope(lo.data[7], hi.data[7], s3.z, s3.w);
+                        } else {
+                            const int row        = laneId / 4;
+                            const int col        = (laneId % 4) * 2;
+                            const int token      = warpId * WARP_M + m * INSN_M + row;
+                            const int angle_base = head * HEAD_DIM + n * INSN_N + col;
+                            const float *rope_lo = ptr_rotemb + token * HEAD_DIM;
+                            const float *rope_hi = ptr_rotemb + (token + 8) * HEAD_DIM;
 
-                        apply_pair(0, angle_base + 0, rope_lo);
-                        apply_pair(1, angle_base + 1, rope_lo);
-                        apply_pair(2, angle_base + 0, rope_hi);
-                        apply_pair(3, angle_base + 1, rope_hi);
-                        apply_pair(4, angle_base + 8, rope_lo);
-                        apply_pair(5, angle_base + 9, rope_lo);
-                        apply_pair(6, angle_base + 8, rope_hi);
-                        apply_pair(7, angle_base + 9, rope_hi);
+                            auto apply_pair = [&](int index, int angle, const float *rope_ptr) ALWAYSINLINE {
+                                apply_rope(
+                                    lo.data[index], hi.data[index], rope_ptr[angle], rope_ptr[angle + HEAD_DIM / 2]);
+                            };
+
+                            apply_pair(0, angle_base + 0, rope_lo);
+                            apply_pair(1, angle_base + 1, rope_lo);
+                            apply_pair(2, angle_base + 0, rope_hi);
+                            apply_pair(3, angle_base + 1, rope_hi);
+                            apply_pair(4, angle_base + 8, rope_lo);
+                            apply_pair(5, angle_base + 9, rope_lo);
+                            apply_pair(6, angle_base + 8, rope_hi);
+                            apply_pair(7, angle_base + 9, rope_hi);
+                        }
 
                         fpsum[m * WARP_N_TILES + n + n_offset] = packed_fp32_to_fp16(lo);
                         fpsum[m * WARP_N_TILES + n + n_hi_delta + n_offset] = packed_fp32_to_fp16(hi);
@@ -559,13 +588,23 @@ public:
             const bool is_k = !is_q && bn < binfo.numBlocksN * 2 / 3;
 
             if (is_q || is_k) {
-                apply(fpsum,
-                      args.rotary_emb + bm * BLOCK_M * HEAD_DIM,
-                      is_q ? args.rmsnorm_weight_q : args.rmsnorm_weight_k,
-                      args.epsilon);
+                if constexpr (PACKED) {
+                    apply(fpsum,
+                          args.rotary_emb + bm * NUM_WARPS * WARP_M_TILES * WARP_N_ROTEMB_TILES * WARP_SIZE,
+                          is_q ? args.rmsnorm_weight_q : args.rmsnorm_weight_k,
+                          args.epsilon);
+                } else {
+                    apply(fpsum,
+                          args.rotary_emb + bm * BLOCK_M * HEAD_DIM,
+                          is_q ? args.rmsnorm_weight_q : args.rmsnorm_weight_k,
+                          args.epsilon);
+                }
             }
         }
     };
+
+    using EpilogueRMSNormRopeHalfSplit       = EpilogueRMSNormRopeHalfSplitImpl<false>;
+    using EpilogueRMSNormRopeHalfSplitPacked = EpilogueRMSNormRopeHalfSplitImpl<true>;
 
     struct EpiloguePackQKV {
         using attn_half_t  = half;

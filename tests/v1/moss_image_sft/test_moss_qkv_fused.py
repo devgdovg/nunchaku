@@ -40,12 +40,14 @@ def test_qkv_fused_matches_eager():
     v_atol = float(os.environ.get("MOSS_QKV_FUSED_V_ATOL", str(2 * bf16_eps)))
     v_rtol = float(os.environ.get("MOSS_QKV_FUSED_V_RTOL", str(bf16_eps)))
 
+    rope_layout = os.environ.get("MOSS_QKV_FUSED_ROPE_LAYOUT", "packed").strip().lower()
     torch.manual_seed(0)
     transformer = NunchakuMOSSImageTransformer.from_pretrained(
         ckpt_path,
         torch_dtype=torch.bfloat16,
         device="cuda",
         fused_rope=True,
+        rope_layout=rope_layout,
     )
     block = transformer.layers[0]
     heads = transformer.config.num_heads

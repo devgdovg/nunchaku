@@ -4,7 +4,8 @@
 qkv/proj/ffn_up_gate/ffn_down 已融合并量化。默认只把线性层替换为
 :class:`SVDQW4A4Linear`，norm_q/norm_k、RoPE、SDPA 保持 PyTorch 实现；
 ``fused_rope=True`` 时主 block 额外使用 half-split fused kernel 完成
-qkv + q/k RMSNorm + RoPE。
+qkv + q/k RMSNorm + RoPE；``rope_layout`` 可选 ``"packed"``（默认，MMA
+lane 对齐布局）或 ``"simple"``（stage-1 sin|cos 布局，用于对比）。
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from torch.nn import functional as F
 from ...ops.gemm import svdq_gemm_w4a4_cuda
 from ...ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
 from ...utils import get_precision, pad_tensor
+from ..embeddings import pack_rotemb_for_half_split
 from ..linear import SVDQW4A4Linear
 from ..utils import fuse_linears
 from .utils import NunchakuModelLoaderMixin, patch_scale_key
@@ -79,13 +81,19 @@ def _attention_pre_roped(q, k, v, heads):
 
 
 class NunchakuMOSSImageRopeCache:
-    """Stage-1 simple half-split rotemb cache for the fused qkv kernel.
+    """Half-split rotemb cache for the fused qkv kernel.
 
-    The layout is ``[1, padded_S, HEAD_DIM]`` float32: first half sin, second
-    half cos. The cache is cleared at the start of every transformer forward.
+    ``layout="simple"`` keeps the stage-1 ``[1, padded_S, HEAD_DIM]`` layout
+    (first half sin, second half cos). ``layout="packed"`` first pads the
+    logical ``[1, S, HEAD_DIM/2, 1, 2]`` tensor to 256 tokens and then applies
+    :func:`pack_rotemb_for_half_split`. The cache is cleared at the start of
+    every transformer forward.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, layout: str = "packed") -> None:
+        if layout not in ("simple", "packed"):
+            raise ValueError(f"rope layout must be 'simple' or 'packed', got {layout!r}")
+        self.layout = layout
         self.cache: dict[tuple[object, ...], torch.Tensor] = {}
 
     def clear(self) -> None:
@@ -95,7 +103,13 @@ class NunchakuMOSSImageRopeCache:
         key = (rope.data_ptr(), tuple(rope.shape))
         packed = self.cache.get(key)
         if packed is None:
-            packed = pad_tensor(rope.float(), 256, dim=1)
+            rope = rope.float()
+            if self.layout == "packed":
+                sin, cos = rope.chunk(2, dim=-1)
+                rotemb = torch.stack((sin, cos), dim=-1).unsqueeze(-2)  # [1, S, HEAD_DIM/2, 1, 2]
+                packed = pack_rotemb_for_half_split(pad_tensor(rotemb, 256, dim=1))
+            else:
+                packed = pad_tensor(rope, 256, dim=1)
             self.cache[key] = packed
         return packed
 
@@ -282,6 +296,7 @@ class NunchakuMOSSImageBlock(nn.Module):
         rank: int,
         use_fused_rope: bool = False,
         rope_cache: NunchakuMOSSImageRopeCache | None = None,
+        rope_mode: int = 2,
     ) -> None:
         super().__init__()
         self.heads = orig.heads
@@ -289,6 +304,7 @@ class NunchakuMOSSImageBlock(nn.Module):
         self.q_norm, self.k_norm = orig.q_norm, orig.k_norm
         self.use_fused_rope = use_fused_rope
         self.rope_cache = rope_cache
+        self.rope_mode = rope_mode
         with torch.device("meta"):
             qkv = fuse_linears([orig.proj["q"], orig.proj["k"], orig.proj["v"]])
         self.proj = nn.ModuleDict(
@@ -330,7 +346,7 @@ class NunchakuMOSSImageBlock(nn.Module):
             norm_q=self.q_norm.weight,
             norm_k=self.k_norm.weight,
             rotary_emb=self.rope_cache.pack(rope),
-            rope_mode=1,
+            rope_mode=self.rope_mode,
         )
         return out.view(batch, seq_len, -1)
 
@@ -385,8 +401,13 @@ class NunchakuMOSSImageTextBlock(nn.Module):
 class NunchakuMOSSImageTransformer(MOSSImageTransformer, NunchakuModelLoaderMixin):
     """Nunchaku 量化版 MOSS-Image transformer。"""
 
-    def _patch_model(self, precision: str = "nvfp4", rank: int = 128, fused_rope: bool = False):
-        self._rope_cache = NunchakuMOSSImageRopeCache() if fused_rope else None
+    def _patch_model(
+        self, precision: str = "nvfp4", rank: int = 128, fused_rope: bool = False, rope_layout: str = "packed"
+    ):
+        if rope_layout not in ("simple", "packed"):
+            raise ValueError(f"rope_layout must be 'simple' or 'packed', got {rope_layout!r}")
+        self._rope_cache = NunchakuMOSSImageRopeCache(layout=rope_layout) if fused_rope else None
+        rope_mode = 1 if rope_layout == "simple" else 2
         if fused_rope:
             self.register_forward_pre_hook(self._clear_rope_cache)
         for index, block in enumerate(self.layers):
@@ -396,6 +417,7 @@ class NunchakuMOSSImageTransformer(MOSSImageTransformer, NunchakuModelLoaderMixi
                 rank=rank,
                 use_fused_rope=fused_rope,
                 rope_cache=self._rope_cache,
+                rope_mode=rope_mode,
             )
         for index, block in enumerate(self.text_embedder.blocks):
             self.text_embedder.blocks[index] = NunchakuMOSSImageTextBlock(block, precision=precision, rank=rank)
@@ -410,6 +432,7 @@ class NunchakuMOSSImageTransformer(MOSSImageTransformer, NunchakuModelLoaderMixi
     def from_pretrained(cls, pretrained_model_name_or_path: str | os.PathLike[str], **kwargs: Any):
         device = kwargs.get("device", "cpu")
         fused_rope = bool(kwargs.pop("fused_rope", False))
+        rope_layout = str(kwargs.pop("rope_layout", "packed")).lower()
         torch_dtype = kwargs.get("torch_dtype", torch.bfloat16)
         if isinstance(pretrained_model_name_or_path, str):
             pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
@@ -429,7 +452,9 @@ class NunchakuMOSSImageTransformer(MOSSImageTransformer, NunchakuModelLoaderMixi
         precision = "nvfp4"
 
         transformer = transformer.to(torch_dtype)
-        transformer._patch_model(precision=precision, rank=rank, fused_rope=fused_rope)
+        transformer._patch_model(
+            precision=precision, rank=rank, fused_rope=fused_rope, rope_layout=rope_layout
+        )
         transformer = transformer.to_empty(device=device)
         if "rope.bands" not in state_dict:
             state_dict["rope.bands"] = transformer.rope._default_bands(transformer.rope.bands.device)
