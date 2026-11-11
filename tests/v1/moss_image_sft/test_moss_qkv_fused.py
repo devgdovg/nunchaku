@@ -31,8 +31,14 @@ def test_qkv_fused_matches_eager():
         pytest.skip("MOSS fused qkv currently requires nvfp4/Blackwell")
 
     seq_len = int(os.environ.get("MOSS_QKV_FUSED_SEQ_LEN", "256"))
-    atol = float(os.environ.get("MOSS_QKV_FUSED_ATOL", "5e-2"))
-    rtol = float(os.environ.get("MOSS_QKV_FUSED_RTOL", "5e-2"))
+    # Use bf16 ULP-based defaults instead of a bare 5e-2.
+    # q/k take different bf16/f32 RMSNorm+RoPE paths; V only goes through the
+    # shared qkv GEMM and should stay within one or two bf16 ULPs.
+    bf16_eps = torch.finfo(torch.bfloat16).eps
+    qk_atol = float(os.environ.get("MOSS_QKV_FUSED_QK_ATOL", str(4 * bf16_eps)))
+    qk_rtol = float(os.environ.get("MOSS_QKV_FUSED_QK_RTOL", str(2 * bf16_eps)))
+    v_atol = float(os.environ.get("MOSS_QKV_FUSED_V_ATOL", str(2 * bf16_eps)))
+    v_rtol = float(os.environ.get("MOSS_QKV_FUSED_V_RTOL", str(bf16_eps)))
 
     torch.manual_seed(0)
     transformer = NunchakuMOSSImageTransformer.from_pretrained(
@@ -50,28 +56,46 @@ def test_qkv_fused_matches_eager():
     # Simple stage-1 layout: first half sin, second half cos, already padded to 256.
     sin = torch.rand(1, seq_len, head_dim // 2, device="cuda", dtype=torch.float32)
     cos = torch.rand(1, seq_len, head_dim // 2, device="cuda", dtype=torch.float32)
-    rope = torch.cat((sin, cos), dim=-1)
-
-    with torch.no_grad():
-        qkv_eager = block._qkv_eager(y)
-        qkv_fused = block._qkv_fused(y, rope)
-
-    qe, ke, ve = qkv_eager.chunk(3, dim=-1)
-    qf, kf, vf = qkv_fused.chunk(3, dim=-1)
-
-    # _qkv_eager applies q/k RMSNorm but not RoPE; _qkv_fused applies both.
-    rope_eager = rope.to(dtype=y.dtype)
-    qe = _rotate(qe.reshape(1, seq_len, heads, head_dim), rope_eager).flatten(2)
-    ke = _rotate(ke.reshape(1, seq_len, heads, head_dim), rope_eager).flatten(2)
+    random_rope = torch.cat((sin, cos), dim=-1)
+    identity_rope = torch.cat(
+        (
+            torch.zeros(1, seq_len, head_dim // 2, device="cuda", dtype=torch.float32),
+            torch.ones(1, seq_len, head_dim // 2, device="cuda", dtype=torch.float32),
+        ),
+        dim=-1,
+    )
 
     def _diff(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
-        diff = (actual.float() - expected.float()).abs()
-        print(f"{name}: max_abs_diff={diff.max().item():.6f}, mean_abs_diff={diff.mean().item():.6f}")
+        actual_f, expected_f = actual.float(), expected.float()
+        diff = (actual_f - expected_f).abs()
+        abs_value = expected_f.abs()
+        rel = diff / abs_value.clamp_min(1e-12)
+        print(
+            f"{name}: max_abs_diff={diff.max().item():.6f}, mean_abs_diff={diff.mean().item():.6f}, "
+            f"max_abs_value={abs_value.max().item():.6f}, max_rel_diff={rel.max().item():.6f}"
+        )
 
-    _diff("q", qf, qe)
-    _diff("k", kf, ke)
-    _diff("v", vf, ve)
+    def _compare(label: str, rope: torch.Tensor) -> None:
+        with torch.no_grad():
+            qkv_eager = block._qkv_eager(y)
+            qkv_fused = block._qkv_fused(y, rope)
 
-    torch.testing.assert_close(qf.float(), qe.float(), atol=atol, rtol=rtol)
-    torch.testing.assert_close(kf.float(), ke.float(), atol=atol, rtol=rtol)
-    torch.testing.assert_close(vf.float(), ve.float(), atol=atol, rtol=rtol)
+        qe, ke, ve = qkv_eager.chunk(3, dim=-1)
+        qf, kf, vf = qkv_fused.chunk(3, dim=-1)
+
+        # _qkv_eager applies q/k RMSNorm but not RoPE; _qkv_fused applies both.
+        rope_eager = rope.to(dtype=y.dtype)
+        qe = _rotate(qe.reshape(1, seq_len, heads, head_dim), rope_eager).flatten(2)
+        ke = _rotate(ke.reshape(1, seq_len, heads, head_dim), rope_eager).flatten(2)
+
+        print(f"[{label}]")
+        _diff("q", qf, qe)
+        _diff("k", kf, ke)
+        _diff("v", vf, ve)
+
+        torch.testing.assert_close(qf.float(), qe.float(), atol=qk_atol, rtol=qk_rtol)
+        torch.testing.assert_close(kf.float(), ke.float(), atol=qk_atol, rtol=qk_rtol)
+        torch.testing.assert_close(vf.float(), ve.float(), atol=v_atol, rtol=v_rtol)
+
+    _compare("random-rope", random_rope)
+    _compare("identity-rope", identity_rope)
