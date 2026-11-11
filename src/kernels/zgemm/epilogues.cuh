@@ -479,32 +479,7 @@ public:
                 }
             }
 
-            // RMSNorm pass (same arithmetic as EpilogueRMSNormRope, without RoPE).
-#pragma unroll
-            for (int head = 0; head < NUM_HEADS_PER_WARP; head++) {
-                const int n_offset = head * WARP_N_TILES_PER_HEAD;
-
-#pragma unroll
-                for (int n = 0; n < WARP_N_TILES_PER_HEAD; n++) {
-                    packed_f32psum_t rms = packed_fp16_to_fp32(
-                        EpilogueRMSNormRope::load_rmsnorm_from_shmem(&shmem_rmsnorm[warpId][0], n));
-#pragma unroll
-                    for (int m = 0; m < WARP_M_TILES; m++) {
-                        packed_f32psum_t pack = packed_fp16_to_fp32(fpsum[m * WARP_N_TILES + n + n_offset]);
-                        pack.data[0] *= rmsnorm_coef[head][m][0] * rms.data[0];
-                        pack.data[1] *= rmsnorm_coef[head][m][0] * rms.data[1];
-                        pack.data[2] *= rmsnorm_coef[head][m][1] * rms.data[2];
-                        pack.data[3] *= rmsnorm_coef[head][m][1] * rms.data[3];
-                        pack.data[4] *= rmsnorm_coef[head][m][0] * rms.data[4];
-                        pack.data[5] *= rmsnorm_coef[head][m][0] * rms.data[5];
-                        pack.data[6] *= rmsnorm_coef[head][m][1] * rms.data[6];
-                        pack.data[7] *= rmsnorm_coef[head][m][1] * rms.data[7];
-                        fpsum[m * WARP_N_TILES + n + n_offset] = packed_fp32_to_fp16(pack);
-                    }
-                }
-            }
-
-            // Half-split RoPE: tile n and n+4 (columns j and j+64) live in the same lane.
+            // Single f32 pass: RMSNorm + half-split RoPE, then one f16 round-trip.
             auto apply_rope = [](float &x, float &y, float sin, float cos) ALWAYSINLINE {
                 float ix = x, iy = y;
                 x = ix * cos - iy * sin;
@@ -517,10 +492,35 @@ public:
 
 #pragma unroll
                 for (int n = 0; n < WARP_N_TILES_PER_HEAD / 2; n++) {
+                    constexpr int n_hi_delta = WARP_N_TILES_PER_HEAD / 2;
+                    packed_f32psum_t rms_lo = packed_fp16_to_fp32(
+                        EpilogueRMSNormRope::load_rmsnorm_from_shmem(&shmem_rmsnorm[warpId][0], n));
+                    packed_f32psum_t rms_hi = packed_fp16_to_fp32(
+                        EpilogueRMSNormRope::load_rmsnorm_from_shmem(&shmem_rmsnorm[warpId][0], n + n_hi_delta));
+
 #pragma unroll
                     for (int m = 0; m < WARP_M_TILES; m++) {
                         packed_f32psum_t lo = packed_fp16_to_fp32(fpsum[m * WARP_N_TILES + n + n_offset]);
-                        packed_f32psum_t hi = packed_fp16_to_fp32(fpsum[m * WARP_N_TILES + n + 4 + n_offset]);
+                        packed_f32psum_t hi = packed_fp16_to_fp32(
+                            fpsum[m * WARP_N_TILES + n + n_hi_delta + n_offset]);
+
+                        lo.data[0] *= rmsnorm_coef[head][m][0] * rms_lo.data[0];
+                        lo.data[1] *= rmsnorm_coef[head][m][0] * rms_lo.data[1];
+                        lo.data[2] *= rmsnorm_coef[head][m][1] * rms_lo.data[2];
+                        lo.data[3] *= rmsnorm_coef[head][m][1] * rms_lo.data[3];
+                        lo.data[4] *= rmsnorm_coef[head][m][0] * rms_lo.data[4];
+                        lo.data[5] *= rmsnorm_coef[head][m][0] * rms_lo.data[5];
+                        lo.data[6] *= rmsnorm_coef[head][m][1] * rms_lo.data[6];
+                        lo.data[7] *= rmsnorm_coef[head][m][1] * rms_lo.data[7];
+
+                        hi.data[0] *= rmsnorm_coef[head][m][0] * rms_hi.data[0];
+                        hi.data[1] *= rmsnorm_coef[head][m][0] * rms_hi.data[1];
+                        hi.data[2] *= rmsnorm_coef[head][m][1] * rms_hi.data[2];
+                        hi.data[3] *= rmsnorm_coef[head][m][1] * rms_hi.data[3];
+                        hi.data[4] *= rmsnorm_coef[head][m][0] * rms_hi.data[4];
+                        hi.data[5] *= rmsnorm_coef[head][m][0] * rms_hi.data[5];
+                        hi.data[6] *= rmsnorm_coef[head][m][1] * rms_hi.data[6];
+                        hi.data[7] *= rmsnorm_coef[head][m][1] * rms_hi.data[7];
 
                         const int row        = laneId / 4;
                         const int col        = (laneId % 4) * 2;
@@ -542,8 +542,8 @@ public:
                         apply_pair(6, angle_base + 8, rope_hi);
                         apply_pair(7, angle_base + 9, rope_hi);
 
-                        fpsum[m * WARP_N_TILES + n + n_offset]     = packed_fp32_to_fp16(lo);
-                        fpsum[m * WARP_N_TILES + n + 4 + n_offset] = packed_fp32_to_fp16(hi);
+                        fpsum[m * WARP_N_TILES + n + n_offset] = packed_fp32_to_fp16(lo);
+                        fpsum[m * WARP_N_TILES + n + n_hi_delta + n_offset] = packed_fp32_to_fp16(hi);
                     }
                 }
             }
