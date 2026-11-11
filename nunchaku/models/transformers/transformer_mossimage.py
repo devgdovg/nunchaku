@@ -1,8 +1,10 @@
 """MOSS-Image-SFT 量化推理实现。
 
 量化 ckpt 中主 block 的 qkv/o/ffn_up_gate/ffn_down 以及 text block 的
-qkv/proj/ffn_up_gate/ffn_down 已融合并量化；这里只把对应线性层替换为
-:class:`SVDQW4A4Linear`，norm_q/norm_k、RoPE、SDPA 保持 PyTorch 实现。
+qkv/proj/ffn_up_gate/ffn_down 已融合并量化。默认只把线性层替换为
+:class:`SVDQW4A4Linear`，norm_q/norm_k、RoPE、SDPA 保持 PyTorch 实现；
+``fused_rope=True`` 时主 block 额外使用 half-split fused kernel 完成
+qkv + q/k RMSNorm + RoPE。
 """
 
 from __future__ import annotations
@@ -20,7 +22,9 @@ from huggingface_hub import utils
 from torch import nn
 from torch.nn import functional as F
 
-from ...utils import get_precision
+from ...ops.gemm import svdq_gemm_w4a4_cuda
+from ...ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
+from ...utils import get_precision, pad_tensor
 from ..linear import SVDQW4A4Linear
 from ..utils import fuse_linears
 from .utils import NunchakuModelLoaderMixin, patch_scale_key
@@ -63,6 +67,37 @@ def _attention(q, k, v, rope, heads):
     k = _rotate(k.reshape(shape), rope).transpose(1, 2)
     v = v.reshape(shape).transpose(1, 2)
     return F.scaled_dot_product_attention(q.to(v.dtype), k.to(v.dtype), v).transpose(1, 2).flatten(2)
+
+
+def _attention_pre_roped(q, k, v, heads):
+    """Attention for q/k already normalized and RoPE-rotated by the fused kernel."""
+    shape = (*q.shape[:2], heads, q.shape[-1] // heads)
+    q = q.reshape(shape).transpose(1, 2)
+    k = k.reshape(shape).transpose(1, 2)
+    v = v.reshape(shape).transpose(1, 2)
+    return F.scaled_dot_product_attention(q.to(v.dtype), k.to(v.dtype), v).transpose(1, 2).flatten(2)
+
+
+class NunchakuMOSSImageRopeCache:
+    """Stage-1 simple half-split rotemb cache for the fused qkv kernel.
+
+    The layout is ``[1, padded_S, HEAD_DIM]`` float32: first half sin, second
+    half cos. The cache is cleared at the start of every transformer forward.
+    """
+
+    def __init__(self) -> None:
+        self.cache: dict[tuple[object, ...], torch.Tensor] = {}
+
+    def clear(self) -> None:
+        self.cache.clear()
+
+    def pack(self, rope: torch.Tensor) -> torch.Tensor:
+        key = (rope.data_ptr(), tuple(rope.shape))
+        packed = self.cache.get(key)
+        if packed is None:
+            packed = pad_tensor(rope.float(), 256, dim=1)
+            self.cache[key] = packed
+        return packed
 
 
 class _TextBlock(nn.Module):
@@ -239,11 +274,21 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
 class NunchakuMOSSImageBlock(nn.Module):
     """量化后的主 block：qkv/o/ffn_up_gate/ffn_down 使用 SVDQW4A4Linear。"""
 
-    def __init__(self, orig: _Block, *, precision: str, rank: int) -> None:
+    def __init__(
+        self,
+        orig: _Block,
+        *,
+        precision: str,
+        rank: int,
+        use_fused_rope: bool = False,
+        rope_cache: NunchakuMOSSImageRopeCache | None = None,
+    ) -> None:
         super().__init__()
         self.heads = orig.heads
         self.norm1, self.norm2 = orig.norm1, orig.norm2
         self.q_norm, self.k_norm = orig.q_norm, orig.k_norm
+        self.use_fused_rope = use_fused_rope
+        self.rope_cache = rope_cache
         with torch.device("meta"):
             qkv = fuse_linears([orig.proj["q"], orig.proj["k"], orig.proj["v"]])
         self.proj = nn.ModuleDict(
@@ -255,15 +300,58 @@ class NunchakuMOSSImageBlock(nn.Module):
             }
         )
 
+    def _qkv_fused(self, y: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
+        """Run qkv projection + q/k RMSNorm + half-split RoPE in one kernel."""
+        qkv_linear = self.proj["qkv"]
+        batch, seq_len, channels = y.shape
+        assert batch == 1, "MOSS fused RoPE currently expects one sample per block call"
+        assert self.rope_cache is not None, "fused RoPE requires a rope cache"
+        flat = y.reshape(batch * seq_len, channels)
+        quantized, ascales, lora_act = svdq_quantize_w4a4_act_fuse_lora_cuda(
+            flat,
+            lora_down=qkv_linear.proj_down,
+            smooth=qkv_linear.smooth_factor,
+            fp4=qkv_linear.precision == "nvfp4",
+            pad_size=256,
+        )
+        out = torch.empty(flat.shape[0], qkv_linear.out_features, dtype=flat.dtype, device=flat.device)
+        svdq_gemm_w4a4_cuda(
+            act=quantized,
+            wgt=qkv_linear.qweight,
+            out=out,
+            ascales=ascales,
+            wscales=qkv_linear.wscales,
+            lora_act_in=lora_act,
+            lora_up=qkv_linear.proj_up,
+            bias=qkv_linear.bias,
+            fp4=qkv_linear.precision == "nvfp4",
+            alpha=1.0 if qkv_linear.precision == "nvfp4" else None,
+            wcscales=qkv_linear.wcscales,
+            norm_q=self.q_norm.weight,
+            norm_k=self.k_norm.weight,
+            rotary_emb=self.rope_cache.pack(rope),
+            rope_mode=1,
+        )
+        return out.view(batch, seq_len, -1)
+
+    def _qkv_eager(self, y: torch.Tensor) -> torch.Tensor:
+        qkv = self.proj["qkv"](y).chunk(3, -1)
+        q, k, v = qkv
+        q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
+        k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
+        return torch.cat((q, k, v), dim=-1)
+
     def forward(self, x, rope, modulation):
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
         y = self.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
         dtype = self.proj["qkv"].proj_up.dtype
         y = y.to(dtype)
-        q, k, v = self.proj["qkv"](y).chunk(3, -1)
-        q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
-        k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
-        x = x + self.proj["o"](_attention(q, k, v, rope, self.heads)) * gate_a[:, None]
+        qkv = self._qkv_fused(y, rope) if self.use_fused_rope else self._qkv_eager(y)
+        q, k, v = qkv.chunk(3, -1)
+        attn = (
+            _attention_pre_roped(q, k, v, self.heads) if self.use_fused_rope else _attention(q, k, v, rope, self.heads)
+        )
+        x = x + self.proj["o"](attn) * gate_a[:, None]
         y = self.norm2(x) * (1 + scale_f[:, None]) + shift_f[:, None]
         hidden, gate = self.proj["ffn_up_gate"](y.to(dtype)).chunk(2, -1)
         return x + self.proj["ffn_down"](situ(hidden, gate)) * gate_f[:, None]
@@ -297,17 +385,31 @@ class NunchakuMOSSImageTextBlock(nn.Module):
 class NunchakuMOSSImageTransformer(MOSSImageTransformer, NunchakuModelLoaderMixin):
     """Nunchaku 量化版 MOSS-Image transformer。"""
 
-    def _patch_model(self, precision: str = "nvfp4", rank: int = 128):
+    def _patch_model(self, precision: str = "nvfp4", rank: int = 128, fused_rope: bool = False):
+        self._rope_cache = NunchakuMOSSImageRopeCache() if fused_rope else None
+        if fused_rope:
+            self.register_forward_pre_hook(self._clear_rope_cache)
         for index, block in enumerate(self.layers):
-            self.layers[index] = NunchakuMOSSImageBlock(block, precision=precision, rank=rank)
+            self.layers[index] = NunchakuMOSSImageBlock(
+                block,
+                precision=precision,
+                rank=rank,
+                use_fused_rope=fused_rope,
+                rope_cache=self._rope_cache,
+            )
         for index, block in enumerate(self.text_embedder.blocks):
             self.text_embedder.blocks[index] = NunchakuMOSSImageTextBlock(block, precision=precision, rank=rank)
         return self
+
+    def _clear_rope_cache(self, module: nn.Module, args: tuple[Any, ...]) -> None:
+        if self._rope_cache is not None:
+            self._rope_cache.clear()
 
     @classmethod
     @utils.validate_hf_hub_args
     def from_pretrained(cls, pretrained_model_name_or_path: str | os.PathLike[str], **kwargs: Any):
         device = kwargs.get("device", "cpu")
+        fused_rope = bool(kwargs.pop("fused_rope", False))
         torch_dtype = kwargs.get("torch_dtype", torch.bfloat16)
         if isinstance(pretrained_model_name_or_path, str):
             pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
@@ -327,7 +429,7 @@ class NunchakuMOSSImageTransformer(MOSSImageTransformer, NunchakuModelLoaderMixi
         precision = "nvfp4"
 
         transformer = transformer.to(torch_dtype)
-        transformer._patch_model(precision=precision, rank=rank)
+        transformer._patch_model(precision=precision, rank=rank, fused_rope=fused_rope)
         transformer = transformer.to_empty(device=device)
         if "rope.bands" not in state_dict:
             state_dict["rope.bands"] = transformer.rope._default_bands(transformer.rope.bands.device)
