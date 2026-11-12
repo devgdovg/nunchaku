@@ -165,7 +165,7 @@ def _load_pipeline(transformer):
     if pipe.transformer is not transformer:
         pipe.register_modules(transformer=transformer)
     pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config)
-    pipe.enable_model_cpu_offload()
+    pipe.to("cuda")
     return pipe
 
 
