@@ -4,7 +4,7 @@ import pytest
 import torch
 from nunchaku._C import ops
 
-from nunchaku.models.embeddings import pack_rotemb, pack_rotemb_for_half_split
+from nunchaku.models.embeddings import pack_rotemb
 
 HEAD_DIM = 128
 M = 256
@@ -39,7 +39,7 @@ def _reference(
     return torch.cat((q, k, v), dim=-1)
 
 
-@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize("mode", [0, 1])
 def test_rmsnorm_rope_epilogue(mode):
     torch.manual_seed(0)
     input_t = torch.randn(M, N, device="cuda", dtype=torch.float16)
@@ -49,13 +49,11 @@ def test_rmsnorm_rope_epilogue(mode):
 
     sin = torch.rand(M, HEAD_DIM // 2, device="cuda", dtype=torch.float32)
     cos = torch.rand(M, HEAD_DIM // 2, device="cuda", dtype=torch.float32)
-    logical = torch.stack((sin, cos), dim=-1).unsqueeze(-2).unsqueeze(0)
     if mode == 0:
+        logical = torch.stack((sin, cos), dim=-1).unsqueeze(-2).unsqueeze(0)
         rotemb = pack_rotemb(logical)
-    elif mode == 1:
-        rotemb = torch.cat((sin, cos), dim=-1).unsqueeze(0).float()
     else:
-        rotemb = pack_rotemb_for_half_split(logical)
+        rotemb = torch.cat((sin, cos), dim=-1).unsqueeze(0).float()
 
     ops.test_rmsnorm_rope(input_t, output, norm_q, norm_k, rotemb, mode)
 

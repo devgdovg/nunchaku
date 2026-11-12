@@ -25,8 +25,7 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize("rope_layout", ["simple", "packed"])
-def test_text_qkv_fused_matches_eager(rope_layout):
+def test_text_qkv_fused_matches_eager():
     if get_precision() != "fp4":
         pytest.skip("MOSS fused qkv currently requires nvfp4/Blackwell")
 
@@ -42,8 +41,6 @@ def test_text_qkv_fused_matches_eager(rope_layout):
         ckpt_path,
         torch_dtype=torch.bfloat16,
         device="cuda",
-        fused_rope=True,
-        rope_layout=rope_layout,
     )
     block = transformer.text_embedder.blocks[0]
     heads = transformer.config.num_heads
@@ -62,6 +59,12 @@ def test_text_qkv_fused_matches_eager(rope_layout):
         dim=-1,
     )
 
+    def _qkv_eager(y: torch.Tensor) -> torch.Tensor:
+        q, k, v = block.qkv(y).chunk(3, -1)
+        q = block.q_norm(q.unflatten(-1, (heads, -1))).flatten(2)
+        k = block.k_norm(k.unflatten(-1, (heads, -1))).flatten(2)
+        return torch.cat((q, k, v), dim=-1)
+
     def _diff(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
         actual_f, expected_f = actual.float(), expected.float()
         diff = (actual_f - expected_f).abs()
@@ -74,8 +77,9 @@ def test_text_qkv_fused_matches_eager(rope_layout):
 
     def _compare(label: str, rope: torch.Tensor) -> None:
         with torch.no_grad():
-            qkv_eager = block._qkv_eager(block.norm1(x))
-            qkv_fused = block._qkv_fused(block.norm1(x), rope)
+            y = block.norm1(x)
+            qkv_eager = _qkv_eager(y)
+            qkv_fused = block._qkv_fused(y, rope)
 
         qe, ke, ve = qkv_eager.chunk(3, dim=-1)
         qf, kf, vf = qkv_fused.chunk(3, dim=-1)
@@ -84,7 +88,7 @@ def test_text_qkv_fused_matches_eager(rope_layout):
         qe = _rotate(qe.reshape(1, seq_len, heads, head_dim), rope_eager).flatten(2)
         ke = _rotate(ke.reshape(1, seq_len, heads, head_dim), rope_eager).flatten(2)
 
-        print(f"[{rope_layout}:{label}]")
+        print(f"[{label}]")
         _diff("q", qf, qe)
         _diff("k", kf, ke)
         _diff("v", vf, ve)

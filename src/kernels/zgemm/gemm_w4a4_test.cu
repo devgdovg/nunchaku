@@ -11,7 +11,7 @@ void test_rmsnorm_rope(
     const int N = input.shape[1];
     assert(input.shape.dataExtent == output.shape.dataExtent);
     assert(input.scalar_type() == Tensor::FP16);
-    assert(rope_mode == 0 || rope_mode == 1 || rope_mode == 2);
+    assert(rope_mode == 0 || rope_mode == 1);
 
     using GEMM = Epilogues<GEMMConfig_W4A4_FP16>;
 
@@ -43,33 +43,8 @@ void test_rmsnorm_rope(
                                                .epsilon          = 1e-6,
                                            }});
         checkCUDA(cudaGetLastError());
-    } else if (rope_mode == 1) {
-        using Epilogue = GEMM::EpilogueRMSNormRopeHalfSplit;
-        using kernel   = typename GEMM::test_epilogue_kernel<Epilogue>;
-
-        auto func = invoke_kernel<kernel, typename kernel::Arguments>;
-
-        checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, kernel::SHMEM_SIZE));
-
-        dim3 grid(M / GEMM::BLOCK_M, N / GEMM::BLOCK_N);
-
-        func<<<grid, GEMM::WARP_SIZE * GEMM::NUM_WARPS, kernel::SHMEM_SIZE, getCurrentCUDAStream()>>>(
-            typename kernel::Arguments{.input  = input.data_ptr<GEMM::half_t>(),
-                                       .output = output.data_ptr<GEMM::half_t>(),
-                                       .M      = M,
-                                       .N      = N,
-                                       .actualM = M,
-                                       .actualN = N,
-                                       .argsEpilogue =
-                                           typename Epilogue::Arguments{
-                                               .rotary_emb = rotary_emb.data_ptr<typename Epilogue::packed_rotemb_t>(),
-                                               .rmsnorm_weight_q = norm_q.data_ptr<GEMM::half_t>(),
-                                               .rmsnorm_weight_k = norm_k.data_ptr<GEMM::half_t>(),
-                                               .epsilon          = 1e-6,
-                                           }});
-        checkCUDA(cudaGetLastError());
     } else {
-        using Epilogue = GEMM::EpilogueRMSNormRopeHalfSplitPacked;
+        using Epilogue = GEMM::EpilogueRMSNormRopeHalfSplit;
         using kernel   = typename GEMM::test_epilogue_kernel<Epilogue>;
 
         auto func = invoke_kernel<kernel, typename kernel::Arguments>;

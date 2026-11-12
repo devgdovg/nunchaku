@@ -1,8 +1,7 @@
-"""Benchmark MOSS-Image-SFT eager / fused-simple / fused-packed qkv paths.
+"""Benchmark the MOSS-Image-SFT fused qkv / RMSNorm / RoPE path.
 
-The quantized checkpoint already contains the merged 8-step DMD LoRA, so this
-script only compares inference paths. main blocks and text blocks use the same
-selected qkv + RMSNorm + RoPE mode.
+The quantized checkpoint already contains the merged 8-step DMD LoRA. Main
+blocks and text blocks both use the fused half-split RoPE path.
 
 Environment variables
 ---------------------
@@ -63,13 +62,6 @@ PROMPT = os.environ.get(
     "A wide view of a refrigerator beside a kitchen counter with a fruit bowl, soft daylight, highly detailed.",
 )
 
-MODES = {
-    "eager": {"fused_rope": False, "rope_layout": "packed"},
-    "fused-simple": {"fused_rope": True, "rope_layout": "simple"},
-    "fused-packed": {"fused_rope": True, "rope_layout": "packed"},
-}
-
-
 def _sync() -> None:
     torch.cuda.synchronize()
 
@@ -98,14 +90,11 @@ def _summary(name: str, times: list[float], peak_gib: float) -> None:
     )
 
 
-def _load_transformer(mode: str):
-    cfg = MODES[mode]
+def _load_transformer():
     return NunchakuMOSSImageTransformer.from_pretrained(
         ckpt_path,
         torch_dtype=torch.bfloat16,
         device="cuda",
-        fused_rope=cfg["fused_rope"],
-        rope_layout=cfg["rope_layout"],
     )
 
 
@@ -120,29 +109,34 @@ def _transformer_inputs(transformer):
     return hidden, timestep, context, mask
 
 
-def _bench_transformer(mode: str) -> None:
+def _bench_transformer() -> None:
     torch.cuda.empty_cache()
-    transformer = _load_transformer(mode)
+    transformer = _load_transformer()
     hidden, timestep, context, mask = _transformer_inputs(transformer)
 
-    if transformer._rope_cache is not None:
-        rope = transformer.rope(HEIGHT // 16, WIDTH // 16, TEXT_LEN, hidden.device)
+    rope = transformer.rope(HEIGHT // 16, WIDTH // 16, TEXT_LEN, hidden.device).to(torch.bfloat16)
+    text_rope = rope[:, (HEIGHT // 16) * (WIDTH // 16) :]
+
+    def _measure_pack(name: str, value: torch.Tensor) -> None:
         pack_times = []
         for _ in range(5):
             transformer._rope_cache.clear()
             _sync()
             start = time.perf_counter()
-            transformer._rope_cache.pack(rope)
+            transformer._rope_cache.pack(value)
             _sync()
             pack_times.append((time.perf_counter() - start) * 1e3)
-        print(f"[{mode}] first rope pack: median={statistics.median(pack_times):.3f} ms")
+        print(f"{name} rope pack: median={statistics.median(pack_times):.3f} ms")
+
+    _measure_pack("main", rope)
+    _measure_pack("text", text_rope)
 
     def call():
         with torch.no_grad():
             transformer(hidden, timestep, context, encoder_attention_mask=mask)
 
     times, peak_gib = _timed(call)
-    _summary(f"[{mode}] transformer forward", times, peak_gib)
+    _summary("transformer forward", times, peak_gib)
     del transformer
     gc.collect()
     torch.cuda.empty_cache()
@@ -169,9 +163,9 @@ def _load_pipeline(transformer):
     return pipe
 
 
-def _bench_pipeline(mode: str) -> None:
+def _bench_pipeline() -> None:
     torch.cuda.empty_cache()
-    transformer = _load_transformer(mode)
+    transformer = _load_transformer()
     pipe = _load_pipeline(transformer)
 
     def call():
@@ -188,11 +182,11 @@ def _bench_pipeline(mode: str) -> None:
         ).images[0]
 
     times, peak_gib = _timed(call)
-    _summary(f"[{mode}] pipeline {STEPS}-step", times, peak_gib)
+    _summary(f"pipeline {STEPS}-step", times, peak_gib)
     output = os.environ.get("MOSS_IMAGE_FP4_OUTPUT")
     if output:
         call().save(output)
-        print(f"[{mode}] saved {output}")
+        print(f"saved {output}")
     del pipe, transformer
     gc.collect()
     torch.cuda.empty_cache()
@@ -207,8 +201,7 @@ if __name__ == "__main__":
         f"scope={SCOPE}, image={HEIGHT}x{WIDTH}, text_len={TEXT_LEN}, steps={STEPS}, "
         f"warmup={WARMUP}, iters={ITERS}"
     )
-    for name in MODES:
-        if SCOPE in ("transformer", "all"):
-            _bench_transformer(name)
-        if SCOPE in ("pipeline", "all"):
-            _bench_pipeline(name)
+    if SCOPE in ("transformer", "all"):
+        _bench_transformer()
+    if SCOPE in ("pipeline", "all"):
+        _bench_pipeline()

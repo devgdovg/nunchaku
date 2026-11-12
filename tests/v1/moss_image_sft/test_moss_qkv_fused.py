@@ -40,14 +40,11 @@ def test_qkv_fused_matches_eager():
     v_atol = float(os.environ.get("MOSS_QKV_FUSED_V_ATOL", str(2 * bf16_eps)))
     v_rtol = float(os.environ.get("MOSS_QKV_FUSED_V_RTOL", str(bf16_eps)))
 
-    rope_layout = os.environ.get("MOSS_QKV_FUSED_ROPE_LAYOUT", "packed").strip().lower()
     torch.manual_seed(0)
     transformer = NunchakuMOSSImageTransformer.from_pretrained(
         ckpt_path,
         torch_dtype=torch.bfloat16,
         device="cuda",
-        fused_rope=True,
-        rope_layout=rope_layout,
     )
     block = transformer.layers[0]
     heads = transformer.config.num_heads
@@ -67,6 +64,12 @@ def test_qkv_fused_matches_eager():
         dim=-1,
     )
 
+    def _qkv_eager(y: torch.Tensor) -> torch.Tensor:
+        q, k, v = block.proj["qkv"](y).chunk(3, -1)
+        q = block.q_norm(q.unflatten(-1, (heads, -1))).flatten(2)
+        k = block.k_norm(k.unflatten(-1, (heads, -1))).flatten(2)
+        return torch.cat((q, k, v), dim=-1)
+
     def _diff(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
         actual_f, expected_f = actual.float(), expected.float()
         diff = (actual_f - expected_f).abs()
@@ -79,13 +82,13 @@ def test_qkv_fused_matches_eager():
 
     def _compare(label: str, rope: torch.Tensor) -> None:
         with torch.no_grad():
-            qkv_eager = block._qkv_eager(y)
+            qkv_eager = _qkv_eager(y)
             qkv_fused = block._qkv_fused(y, rope)
 
         qe, ke, ve = qkv_eager.chunk(3, dim=-1)
         qf, kf, vf = qkv_fused.chunk(3, dim=-1)
 
-        # _qkv_eager applies q/k RMSNorm but not RoPE; _qkv_fused applies both.
+        # The eager reference applies q/k RMSNorm but not RoPE; _qkv_fused applies both.
         rope_eager = rope.to(dtype=y.dtype)
         qe = _rotate(qe.reshape(1, seq_len, heads, head_dim), rope_eager).flatten(2)
         ke = _rotate(ke.reshape(1, seq_len, heads, head_dim), rope_eager).flatten(2)

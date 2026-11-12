@@ -76,9 +76,7 @@ def svdq_gemm_w4a4_cuda(
         Key RMS normalization.
     rotary_emb : torch.Tensor or None, shape (M, HEAD_DIM // 2, 2, 2), dtype float32, optional
         Packed rotary embeddings. For ``rope_mode=1`` this is the simple
-        ``[M, HEAD_DIM]`` layout (first half sin, second half cos). For
-        ``rope_mode=2`` this is the MMA/lane-aligned layout produced by
-        :func:`nunchaku.models.embeddings.pack_rotemb_for_half_split`.
+        ``[M, HEAD_DIM]`` layout (first half sin, second half cos).
     bias : torch.Tensor or None, shape (N,), dtype float16 or bfloat16, optional
         Bias tensor.
     smooth_factor : torch.Tensor or None, shape (N,), dtype float16 or bfloat16, optional
@@ -109,7 +107,7 @@ def svdq_gemm_w4a4_cuda(
         Number of attention tokens.
     rope_mode : int, default=0
         0 = interleaved RoPE (existing behavior), 1 = half-split RoPE with the
-        simple sin|cos layout, 2 = half-split RoPE with the packed MMA layout.
+        simple sin|cos layout.
 
     Returns
     -------

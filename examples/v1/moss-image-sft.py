@@ -101,13 +101,8 @@ if __name__ == "__main__":
     guidance_scale = float(os.environ.get("MOSS_IMAGE_GUIDANCE", "1.0"))
     seed = int(os.environ.get("MOSS_IMAGE_SEED", "42"))
     strength = float(os.environ.get("MOSS_IMAGE_LORA_STRENGTH", "0.7"))
-    fused_rope = _env_flag("MOSS_IMAGE_FUSED_ROPE", False)
-    rope_layout = os.environ.get("MOSS_IMAGE_ROPE_LAYOUT", "packed").strip().lower()
     bf16_output = os.environ.get("MOSS_IMAGE_BF16_OUTPUT", "moss-image-sft-bf16-lora.png")
-    default_fp4_output = (
-        f"moss-image-sft-fp4-fused-rope-{rope_layout}.png" if fused_rope else "moss-image-sft-fp4.png"
-    )
-    fp4_output = os.environ.get("MOSS_IMAGE_FP4_OUTPUT", default_fp4_output)
+    fp4_output = os.environ.get("MOSS_IMAGE_FP4_OUTPUT", "moss-image-sft-fp4.png")
 
     # 1) bf16 baseline: explicitly merge the DMD LoRA into the official transformer.
     pipe = _load_pipeline()
@@ -123,14 +118,9 @@ if __name__ == "__main__":
         ckpt_path,
         torch_dtype=torch.bfloat16,
         device="cpu",
-        fused_rope=fused_rope,
-        rope_layout=rope_layout,
     )
     pipe = _load_pipeline(transformer=transformer)
-    print(
-        f"quantized pipeline: transformer={type(pipe.transformer).__name__}, "
-        f"fused_rope={fused_rope}, rope_layout={rope_layout}"
-    )
+    print(f"quantized pipeline: transformer={type(pipe.transformer).__name__}, fused qkv+norm+RoPE")
     fp4_image = _generate(pipe, prompt, height, width, steps, guidance_scale, seed)
 
     _save_and_compare(bf16_image, fp4_image, os.path.abspath(bf16_output), os.path.abspath(fp4_output))
