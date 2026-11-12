@@ -3,9 +3,9 @@
 量化 ckpt 中主 block 的 qkv/o/ffn_up_gate/ffn_down 以及 text block 的
 qkv/proj/ffn_up_gate/ffn_down 已融合并量化。默认只把线性层替换为
 :class:`SVDQW4A4Linear`，norm_q/norm_k、RoPE、SDPA 保持 PyTorch 实现；
-``fused_rope=True`` 时主 block 额外使用 half-split fused kernel 完成
-qkv + q/k RMSNorm + RoPE；``rope_layout`` 可选 ``"packed"``（默认，MMA
-lane 对齐布局）或 ``"simple"``（stage-1 sin|cos 布局，用于对比）。
+``fused_rope=True`` 时主 block 和 text block 都使用 half-split fused kernel
+完成 qkv + q/k RMSNorm + RoPE；``rope_layout`` 可选 ``"packed"``（默认，
+MMA lane 对齐布局）或 ``"simple"``（stage-1 sin|cos 布局，用于对比）。
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ class NunchakuMOSSImageRopeCache:
         key = (rope.data_ptr(), tuple(rope.shape))
         packed = self.cache.get(key)
         if packed is None:
-            rope = rope.float()
+            rope = rope.float().contiguous()
             if self.layout == "packed":
                 sin, cos = rope.chunk(2, dim=-1)
                 rotemb = torch.stack((sin, cos), dim=-1).unsqueeze(-2)  # [1, S, HEAD_DIM/2, 1, 2]
@@ -285,6 +285,47 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
         return Transformer2DModelOutput(sample=sample) if return_dict else (sample,)
 
 
+def _run_fused_qkv(
+    y: torch.Tensor,
+    rope: torch.Tensor,
+    linear: SVDQW4A4Linear,
+    q_norm: nn.Module,
+    k_norm: nn.Module,
+    rope_cache: NunchakuMOSSImageRopeCache,
+    rope_mode: int,
+) -> torch.Tensor:
+    """Run qkv projection + q/k RMSNorm + half-split RoPE in one kernel."""
+    batch, seq_len, channels = y.shape
+    assert batch == 1, "MOSS fused RoPE currently expects one sample per block call"
+    flat = y.reshape(batch * seq_len, channels)
+    quantized, ascales, lora_act = svdq_quantize_w4a4_act_fuse_lora_cuda(
+        flat,
+        lora_down=linear.proj_down,
+        smooth=linear.smooth_factor,
+        fp4=linear.precision == "nvfp4",
+        pad_size=256,
+    )
+    out = torch.empty(flat.shape[0], linear.out_features, dtype=flat.dtype, device=flat.device)
+    svdq_gemm_w4a4_cuda(
+        act=quantized,
+        wgt=linear.qweight,
+        out=out,
+        ascales=ascales,
+        wscales=linear.wscales,
+        lora_act_in=lora_act,
+        lora_up=linear.proj_up,
+        bias=linear.bias,
+        fp4=linear.precision == "nvfp4",
+        alpha=1.0 if linear.precision == "nvfp4" else None,
+        wcscales=linear.wcscales,
+        norm_q=q_norm.weight,
+        norm_k=k_norm.weight,
+        rotary_emb=rope_cache.pack(rope),
+        rope_mode=rope_mode,
+    )
+    return out.view(batch, seq_len, -1)
+
+
 class NunchakuMOSSImageBlock(nn.Module):
     """量化后的主 block：qkv/o/ffn_up_gate/ffn_down 使用 SVDQW4A4Linear。"""
 
@@ -317,38 +358,10 @@ class NunchakuMOSSImageBlock(nn.Module):
         )
 
     def _qkv_fused(self, y: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
-        """Run qkv projection + q/k RMSNorm + half-split RoPE in one kernel."""
-        qkv_linear = self.proj["qkv"]
-        batch, seq_len, channels = y.shape
-        assert batch == 1, "MOSS fused RoPE currently expects one sample per block call"
         assert self.rope_cache is not None, "fused RoPE requires a rope cache"
-        flat = y.reshape(batch * seq_len, channels)
-        quantized, ascales, lora_act = svdq_quantize_w4a4_act_fuse_lora_cuda(
-            flat,
-            lora_down=qkv_linear.proj_down,
-            smooth=qkv_linear.smooth_factor,
-            fp4=qkv_linear.precision == "nvfp4",
-            pad_size=256,
+        return _run_fused_qkv(
+            y, rope, self.proj["qkv"], self.q_norm, self.k_norm, self.rope_cache, self.rope_mode
         )
-        out = torch.empty(flat.shape[0], qkv_linear.out_features, dtype=flat.dtype, device=flat.device)
-        svdq_gemm_w4a4_cuda(
-            act=quantized,
-            wgt=qkv_linear.qweight,
-            out=out,
-            ascales=ascales,
-            wscales=qkv_linear.wscales,
-            lora_act_in=lora_act,
-            lora_up=qkv_linear.proj_up,
-            bias=qkv_linear.bias,
-            fp4=qkv_linear.precision == "nvfp4",
-            alpha=1.0 if qkv_linear.precision == "nvfp4" else None,
-            wcscales=qkv_linear.wcscales,
-            norm_q=self.q_norm.weight,
-            norm_k=self.k_norm.weight,
-            rotary_emb=self.rope_cache.pack(rope),
-            rope_mode=self.rope_mode,
-        )
-        return out.view(batch, seq_len, -1)
 
     def _qkv_eager(self, y: torch.Tensor) -> torch.Tensor:
         qkv = self.proj["qkv"](y).chunk(3, -1)
@@ -374,13 +387,25 @@ class NunchakuMOSSImageBlock(nn.Module):
 
 
 class NunchakuMOSSImageTextBlock(nn.Module):
-    """量化后的 text block；ffn_up/gate 已融合为 ffn_up_gate。"""
+    """量化后的 text block；qkv 可选 fused norm+RoPE，ffn_up/gate 已融合。"""
 
-    def __init__(self, orig: _TextBlock, *, precision: str, rank: int) -> None:
+    def __init__(
+        self,
+        orig: _TextBlock,
+        *,
+        precision: str,
+        rank: int,
+        use_fused_rope: bool = False,
+        rope_cache: NunchakuMOSSImageRopeCache | None = None,
+        rope_mode: int = 2,
+    ) -> None:
         super().__init__()
         self.heads = orig.heads
         self.norm1, self.norm2 = orig.norm1, orig.norm2
         self.q_norm, self.k_norm = orig.q_norm, orig.k_norm
+        self.use_fused_rope = use_fused_rope
+        self.rope_cache = rope_cache
+        self.rope_mode = rope_mode
         self.qkv = SVDQW4A4Linear.from_linear(orig.qkv, precision=precision, rank=rank)
         self.proj = SVDQW4A4Linear.from_linear(orig.proj, precision=precision, rank=rank)
         with torch.device("meta"):
@@ -388,11 +413,24 @@ class NunchakuMOSSImageTextBlock(nn.Module):
         self.ffn_up_gate = SVDQW4A4Linear.from_linear(ffn_up_gate, precision=precision, rank=rank)
         self.ffn_down = SVDQW4A4Linear.from_linear(orig.ffn_down, precision=precision, rank=rank)
 
-    def forward(self, x, rope):
-        q, k, v = self.qkv(self.norm1(x)).chunk(3, -1)
+    def _qkv_fused(self, y: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
+        assert self.rope_cache is not None, "fused RoPE requires a rope cache"
+        return _run_fused_qkv(y, rope, self.qkv, self.q_norm, self.k_norm, self.rope_cache, self.rope_mode)
+
+    def _qkv_eager(self, y: torch.Tensor) -> torch.Tensor:
+        q, k, v = self.qkv(y).chunk(3, -1)
         q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
-        x = x + self.proj(_attention(q, k, v, rope, self.heads))
+        return torch.cat((q, k, v), dim=-1)
+
+    def forward(self, x, rope):
+        y = self.norm1(x)
+        qkv = self._qkv_fused(y, rope) if self.use_fused_rope else self._qkv_eager(y)
+        q, k, v = qkv.chunk(3, -1)
+        attn = (
+            _attention_pre_roped(q, k, v, self.heads) if self.use_fused_rope else _attention(q, k, v, rope, self.heads)
+        )
+        x = x + self.proj(attn)
         y = self.norm2(x)
         hidden, gate = self.ffn_up_gate(y).chunk(2, -1)
         return x + self.ffn_down(situ(hidden, gate))
@@ -420,7 +458,14 @@ class NunchakuMOSSImageTransformer(MOSSImageTransformer, NunchakuModelLoaderMixi
                 rope_mode=rope_mode,
             )
         for index, block in enumerate(self.text_embedder.blocks):
-            self.text_embedder.blocks[index] = NunchakuMOSSImageTextBlock(block, precision=precision, rank=rank)
+            self.text_embedder.blocks[index] = NunchakuMOSSImageTextBlock(
+                block,
+                precision=precision,
+                rank=rank,
+                use_fused_rope=fused_rope,
+                rope_cache=self._rope_cache,
+                rope_mode=rope_mode,
+            )
         return self
 
     def _clear_rope_cache(self, module: nn.Module, args: tuple[Any, ...]) -> None:

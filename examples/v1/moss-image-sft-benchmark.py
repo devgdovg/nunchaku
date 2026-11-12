@@ -1,8 +1,8 @@
 """Benchmark MOSS-Image-SFT eager / fused-simple / fused-packed qkv paths.
 
 The quantized checkpoint already contains the merged 8-step DMD LoRA, so this
-script only compares inference paths. Text blocks remain eager in all three
-modes; the measurement isolates the main-block qkv + RMSNorm + RoPE path.
+script only compares inference paths. main blocks and text blocks use the same
+selected qkv + RMSNorm + RoPE mode.
 
 Environment variables
 ---------------------
