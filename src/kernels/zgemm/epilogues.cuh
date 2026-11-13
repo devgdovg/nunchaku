@@ -424,6 +424,149 @@ public:
         }
     };
 
+    struct EpilogueRMSNormRopeHalfSplit {
+        static constexpr int HEAD_DIM              = EpilogueRMSNormRope::HEAD_DIM;
+        static constexpr int NUM_HEADS_PER_WARP    = EpilogueRMSNormRope::NUM_HEADS_PER_WARP;
+        static constexpr int WARP_N_TILES_PER_HEAD = EpilogueRMSNormRope::WARP_N_TILES_PER_HEAD;
+
+        // Layout: [M, HEAD_DIM] float32, first HEAD_DIM/2 = sin, second = cos.
+        using packed_rotemb_t = float;
+
+        struct Arguments {
+            const packed_rotemb_t *rotary_emb;
+            const half_t *rmsnorm_weight_q; // [HEAD_DIM]
+            const half_t *rmsnorm_weight_k; // [HEAD_DIM]
+            float epsilon;
+        };
+
+        __device__ __forceinline__ static void
+        apply(fpsum_warp &fpsum, const packed_rotemb_t *ptr_rotemb, const half_t *ptr_rmsnorm_weight, float epsilon) {
+            const int laneId = threadIdx.x % WARP_SIZE;
+            const int warpId = threadIdx.x / WARP_SIZE;
+
+            __shared__ half_t shmem_rmsnorm[NUM_WARPS][HEAD_DIM];
+            EpilogueRMSNormRope::load_rmsnorm(ptr_rmsnorm_weight, &shmem_rmsnorm[warpId][0]);
+            __syncwarp();
+
+            float rmsnorm_coef[NUM_HEADS_PER_WARP][WARP_M_TILES][2];
+
+            auto sqr = [](half2_t val) ALWAYSINLINE {
+                float2 fval = half22float2(val);
+                return fval.x * fval.x + fval.y * fval.y;
+            };
+
+#pragma unroll
+            for (int head = 0; head < NUM_HEADS_PER_WARP; head++) {
+                const int n_offset = head * WARP_N_TILES_PER_HEAD;
+
+#pragma unroll
+                for (int m = 0; m < WARP_M_TILES; m++) {
+                    float sqrsum[2] = {0.0f, 0.0f};
+#pragma unroll
+                    for (int n = 0; n < WARP_N_TILES_PER_HEAD; n++) {
+                        sqrsum[0] += sqr(fpsum[m * WARP_N_TILES + n + n_offset].data[0]);
+                        sqrsum[1] += sqr(fpsum[m * WARP_N_TILES + n + n_offset].data[1]);
+                        sqrsum[0] += sqr(fpsum[m * WARP_N_TILES + n + n_offset].data[2]);
+                        sqrsum[1] += sqr(fpsum[m * WARP_N_TILES + n + n_offset].data[3]);
+                    }
+#pragma unroll
+                    for (int mask = 1; mask <= 2; mask *= 2) {
+                        sqrsum[0] += __shfl_xor_sync(~0, sqrsum[0], mask);
+                        sqrsum[1] += __shfl_xor_sync(~0, sqrsum[1], mask);
+                    }
+                    rmsnorm_coef[head][m][0] = cuda_frsqrt(sqrsum[0] / HEAD_DIM + epsilon);
+                    rmsnorm_coef[head][m][1] = cuda_frsqrt(sqrsum[1] / HEAD_DIM + epsilon);
+                }
+            }
+
+            // Single f32 pass: RMSNorm + half-split RoPE, then one f16 round-trip.
+            auto apply_rope = [](float &x, float &y, float sin, float cos) ALWAYSINLINE {
+                float ix = x, iy = y;
+                x = ix * cos - iy * sin;
+                y = ix * sin + iy * cos;
+            };
+
+#pragma unroll
+            for (int head = 0; head < NUM_HEADS_PER_WARP; head++) {
+                const int n_offset = head * WARP_N_TILES_PER_HEAD;
+
+#pragma unroll
+                for (int n = 0; n < WARP_N_TILES_PER_HEAD / 2; n++) {
+                    constexpr int n_hi_delta = WARP_N_TILES_PER_HEAD / 2;
+                    packed_f32psum_t rms_lo = packed_fp16_to_fp32(
+                        EpilogueRMSNormRope::load_rmsnorm_from_shmem(&shmem_rmsnorm[warpId][0], n));
+                    packed_f32psum_t rms_hi = packed_fp16_to_fp32(
+                        EpilogueRMSNormRope::load_rmsnorm_from_shmem(&shmem_rmsnorm[warpId][0], n + n_hi_delta));
+
+#pragma unroll
+                    for (int m = 0; m < WARP_M_TILES; m++) {
+                        packed_f32psum_t lo = packed_fp16_to_fp32(fpsum[m * WARP_N_TILES + n + n_offset]);
+                        packed_f32psum_t hi = packed_fp16_to_fp32(
+                            fpsum[m * WARP_N_TILES + n + n_hi_delta + n_offset]);
+
+                        lo.data[0] *= rmsnorm_coef[head][m][0] * rms_lo.data[0];
+                        lo.data[1] *= rmsnorm_coef[head][m][0] * rms_lo.data[1];
+                        lo.data[2] *= rmsnorm_coef[head][m][1] * rms_lo.data[2];
+                        lo.data[3] *= rmsnorm_coef[head][m][1] * rms_lo.data[3];
+                        lo.data[4] *= rmsnorm_coef[head][m][0] * rms_lo.data[4];
+                        lo.data[5] *= rmsnorm_coef[head][m][0] * rms_lo.data[5];
+                        lo.data[6] *= rmsnorm_coef[head][m][1] * rms_lo.data[6];
+                        lo.data[7] *= rmsnorm_coef[head][m][1] * rms_lo.data[7];
+
+                        hi.data[0] *= rmsnorm_coef[head][m][0] * rms_hi.data[0];
+                        hi.data[1] *= rmsnorm_coef[head][m][0] * rms_hi.data[1];
+                        hi.data[2] *= rmsnorm_coef[head][m][1] * rms_hi.data[2];
+                        hi.data[3] *= rmsnorm_coef[head][m][1] * rms_hi.data[3];
+                        hi.data[4] *= rmsnorm_coef[head][m][0] * rms_hi.data[4];
+                        hi.data[5] *= rmsnorm_coef[head][m][0] * rms_hi.data[5];
+                        hi.data[6] *= rmsnorm_coef[head][m][1] * rms_hi.data[6];
+                        hi.data[7] *= rmsnorm_coef[head][m][1] * rms_hi.data[7];
+
+                        const int row        = laneId / 4;
+                        const int col        = (laneId % 4) * 2;
+                        const int token      = warpId * WARP_M + m * INSN_M + row;
+                        const int angle_base = head * HEAD_DIM + n * INSN_N + col;
+                        const float *rope_lo = ptr_rotemb + token * HEAD_DIM;
+                        const float *rope_hi = ptr_rotemb + (token + 8) * HEAD_DIM;
+
+                        auto apply_pair = [&](int index, int angle, const float *rope_ptr) ALWAYSINLINE {
+                            apply_rope(lo.data[index], hi.data[index], rope_ptr[angle], rope_ptr[angle + HEAD_DIM / 2]);
+                        };
+
+                        apply_pair(0, angle_base + 0, rope_lo);
+                        apply_pair(1, angle_base + 1, rope_lo);
+                        apply_pair(2, angle_base + 0, rope_hi);
+                        apply_pair(3, angle_base + 1, rope_hi);
+                        apply_pair(4, angle_base + 8, rope_lo);
+                        apply_pair(5, angle_base + 9, rope_lo);
+                        apply_pair(6, angle_base + 8, rope_hi);
+                        apply_pair(7, angle_base + 9, rope_hi);
+
+                        fpsum[m * WARP_N_TILES + n + n_offset] = packed_fp32_to_fp16(lo);
+                        fpsum[m * WARP_N_TILES + n + n_hi_delta + n_offset] = packed_fp32_to_fp16(hi);
+                    }
+                }
+            }
+        }
+
+        __device__ __forceinline__ void
+        operator()(const BlockInfo binfo, fpsum_warp &fpsum, int M, int N, int K, const Arguments &args) {
+            const int bm = binfo.bm;
+            const int bn = binfo.bn;
+
+            assert(binfo.numBlocksN % 3 == 0);
+            const bool is_q = bn < binfo.numBlocksN / 3;
+            const bool is_k = !is_q && bn < binfo.numBlocksN * 2 / 3;
+
+            if (is_q || is_k) {
+                apply(fpsum,
+                      args.rotary_emb + bm * BLOCK_M * HEAD_DIM,
+                      is_q ? args.rmsnorm_weight_q : args.rmsnorm_weight_k,
+                      args.epsilon);
+            }
+        }
+    };
+
     struct EpiloguePackQKV {
         using attn_half_t  = half;
         using attn_half2_t = half2;

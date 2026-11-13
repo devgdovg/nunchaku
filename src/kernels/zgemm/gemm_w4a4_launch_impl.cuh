@@ -37,7 +37,8 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
     Tensor out_q,    // packed attention [B, H, M, D]
     Tensor out_k,    // packed attention [B, H, M, D]
     Tensor out_v,    // packed attention [B, H, M, D]
-    int attn_tokens) {
+    int attn_tokens,
+    int rope_mode) {
 #ifdef __INTELLISENSE__
     static constexpr bool USE_FP4 = false;
 #endif
@@ -352,56 +353,65 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
         assert(rotary_emb.ndims() == 3);
         assert(rotary_emb.shape[0] * rotary_emb.shape[1] == M);
         assert(rotary_emb.shape[2] == Epilogues::EpilogueRMSNormRope::HEAD_DIM);
+        assert(rope_mode == 0 || rope_mode == 1);
 
-        // assert(rotary_emb.numel() == M * GEMM::EpilogueQKVProj::HEAD_DIM / 2 *
-        // GEMM::EpilogueQKVProj::ROTARY_EMB_NUM_ELEMENTS); launch_lora.template operator()<typename
-        // GEMM::EpilogueQKVProj, typename GEMM::EpilogueNop>(typename GEMM::EpilogueQKVProj::Arguments{
-        //     .out = out.data_ptr<half_t>(),
-        //     .actualM = actualM,
-        //     .actualN = actualN,
-        //     .pool_out = poolout.valid() ? poolout.data_ptr<half_t>() : nullptr,
-        //     .rotary_emb = rotary_emb.data_ptr<float>(),
-        //     .rmsnorm_weight_q = norm_q.data_ptr<half_t>(),
-        //     .rmsnorm_weight_k = norm_k.data_ptr<half_t>(),
-        //     .epsilon = 1e-6,
-        // }, {});
+        if (rope_mode == 0) {
+            using EpilogueRope = typename Epilogues::EpilogueRMSNormRope;
+            auto argsRope      = typename EpilogueRope::Arguments{
+                     .rotary_emb       = rotary_emb.data_ptr<typename EpilogueRope::packed_rotemb_t>(),
+                     .rmsnorm_weight_q = norm_q.data_ptr<half_t>(),
+                     .rmsnorm_weight_k = norm_k.data_ptr<half_t>(),
+                     .epsilon          = 1e-6,
+            };
 
-        using EpilogueRope = typename Epilogues::EpilogueRMSNormRope;
-        auto argsRope      = typename Epilogues::EpilogueRMSNormRope::Arguments{
-                 .rotary_emb       = rotary_emb.data_ptr<typename EpilogueRope::packed_rotemb_t>(),
-                 .rmsnorm_weight_q = norm_q.data_ptr<half_t>(),
-                 .rmsnorm_weight_k = norm_k.data_ptr<half_t>(),
-                 .epsilon          = 1e-6,
-        };
-
-        if (out_q.valid()) {
-            launch_lora.template
-            operator()<typename GEMM::EpilogueCombination<EpilogueRope, typename Epilogues::EpiloguePackQKV>,
-                       typename GEMM::EpilogueNop>(
-                {argsRope,
-                 typename Epilogues::EpiloguePackQKV::Arguments{
-                     .out_q        = out_q.data_ptr<typename Epilogues::EpiloguePackQKV::packed_qkv_t>(),
-                     .out_k        = out_k.data_ptr<typename Epilogues::EpiloguePackQKV::packed_qkv_t>(),
-                     .out_v        = out_v.data_ptr<typename Epilogues::EpiloguePackQKV::packed_qkv_t>(),
-                     .actualM      = attn_tokens,
-                     .strideHead_q = int(out_q.stride(1) * out_q.scalar_size() /
-                                         sizeof(typename Epilogues::EpiloguePackQKV::packed_qkv_t)),
-                     .strideHead_k = int(out_k.stride(1) * out_k.scalar_size() /
-                                         sizeof(typename Epilogues::EpiloguePackQKV::packed_qkv_t)),
-                     .strideHead_v = int(out_v.stride(1) * out_v.scalar_size() /
-                                         sizeof(typename Epilogues::EpiloguePackQKV::packed_qkv_t)),
-                 }},
-                {});
+            if (out_q.valid()) {
+                launch_lora.template
+                operator()<typename GEMM::EpilogueCombination<EpilogueRope, typename Epilogues::EpiloguePackQKV>,
+                           typename GEMM::EpilogueNop>(
+                    {argsRope,
+                     typename Epilogues::EpiloguePackQKV::Arguments{
+                         .out_q        = out_q.data_ptr<typename Epilogues::EpiloguePackQKV::packed_qkv_t>(),
+                         .out_k        = out_k.data_ptr<typename Epilogues::EpiloguePackQKV::packed_qkv_t>(),
+                         .out_v        = out_v.data_ptr<typename Epilogues::EpiloguePackQKV::packed_qkv_t>(),
+                         .actualM      = attn_tokens,
+                         .strideHead_q = int(out_q.stride(1) * out_q.scalar_size() /
+                                             sizeof(typename Epilogues::EpiloguePackQKV::packed_qkv_t)),
+                         .strideHead_k = int(out_k.stride(1) * out_k.scalar_size() /
+                                             sizeof(typename Epilogues::EpiloguePackQKV::packed_qkv_t)),
+                         .strideHead_v = int(out_v.stride(1) * out_v.scalar_size() /
+                                             sizeof(typename Epilogues::EpiloguePackQKV::packed_qkv_t)),
+                     }},
+                    {});
+            } else {
+                launch_lora.template operator()<
+                    typename GEMM::EpilogueCombination<EpilogueRope, typename GEMM::EpilogueDefault>,
+                    typename GEMM::EpilogueNop>({argsRope,
+                                                 typename GEMM::EpilogueDefault::Arguments{
+                                                     .out     = out.data_ptr<half_t>(),
+                                                     .actualM = actualM,
+                                                     .actualN = actualN,
+                                                 }},
+                                                {});
+            }
         } else {
-            launch_lora
-                .template operator()<typename GEMM::EpilogueCombination<EpilogueRope, typename GEMM::EpilogueDefault>,
-                                     typename GEMM::EpilogueNop>({argsRope,
-                                                                  typename GEMM::EpilogueDefault::Arguments{
-                                                                      .out     = out.data_ptr<half_t>(),
-                                                                      .actualM = actualM,
-                                                                      .actualN = actualN,
-                                                                  }},
-                                                                 {});
+            // Half-split RoPE currently supports only the standard `out` path.
+            assert(!out_q.valid() && !out_k.valid() && !out_v.valid());
+            using EpilogueRope = typename Epilogues::EpilogueRMSNormRopeHalfSplit;
+            auto argsRope      = typename EpilogueRope::Arguments{
+                     .rotary_emb       = rotary_emb.data_ptr<typename EpilogueRope::packed_rotemb_t>(),
+                     .rmsnorm_weight_q = norm_q.data_ptr<half_t>(),
+                     .rmsnorm_weight_k = norm_k.data_ptr<half_t>(),
+                     .epsilon          = 1e-6,
+            };
+            launch_lora.template operator()<
+                typename GEMM::EpilogueCombination<EpilogueRope, typename GEMM::EpilogueDefault>,
+                typename GEMM::EpilogueNop>({argsRope,
+                                             typename GEMM::EpilogueDefault::Arguments{
+                                                 .out     = out.data_ptr<half_t>(),
+                                                 .actualM = actualM,
+                                                 .actualN = actualN,
+                                             }},
+                                            {});
         }
 
     } else if (out.valid()) {

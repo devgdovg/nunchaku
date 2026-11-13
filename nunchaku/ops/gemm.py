@@ -39,6 +39,7 @@ def svdq_gemm_w4a4_cuda(
     out_k: torch.Tensor | None = None,
     out_v: torch.Tensor | None = None,
     attn_tokens: int = 0,
+    rope_mode: int = 0,
 ):
     """
     Quantized GEMM using SVDQuant W4A4 CUDA kernel, with support for LoRA, rotary embeddings, normalization, and fused activations.
@@ -74,7 +75,8 @@ def svdq_gemm_w4a4_cuda(
     norm_k : torch.Tensor or None, shape (HEAD_DIM,), dtype float16 or bfloat16, optional
         Key RMS normalization.
     rotary_emb : torch.Tensor or None, shape (M, HEAD_DIM // 2, 2, 2), dtype float32, optional
-        Packed rotary embeddings.
+        Packed rotary embeddings. For ``rope_mode=1`` this is the simple
+        ``[M, HEAD_DIM]`` layout (first half sin, second half cos).
     bias : torch.Tensor or None, shape (N,), dtype float16 or bfloat16, optional
         Bias tensor.
     smooth_factor : torch.Tensor or None, shape (N,), dtype float16 or bfloat16, optional
@@ -103,6 +105,9 @@ def svdq_gemm_w4a4_cuda(
         Packed quantized V for attention (used in ``nunchaku-fp16`` attention).
     attn_tokens : int, default=0
         Number of attention tokens.
+    rope_mode : int, default=0
+        0 = interleaved RoPE (existing behavior), 1 = half-split RoPE with the
+        simple sin|cos layout.
 
     Returns
     -------
@@ -157,4 +162,5 @@ def svdq_gemm_w4a4_cuda(
         out_k,
         out_v,
         attn_tokens,
+        rope_mode,
     )

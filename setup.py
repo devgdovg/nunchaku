@@ -67,14 +67,16 @@ def get_sm_targets() -> list[str]:
 if __name__ == "__main__":
     fp = open("nunchaku/__version__.py", "r").read()
     version = eval(fp.strip().split()[-1])
+    
+    devg_version = "devg1.0"
 
     torch_version = torch.__version__.split("+")[0]
     torch_major_minor_version = ".".join(torch_version.split(".")[:2])
     cuda_version = torch.version.cuda  # e.g., "12.4"
     if "dev" in version:
         version = version + date.today().strftime("%Y%m%d")
-    # Version format: 1.2.0+cu12.4torch2.4
-    version = f"{version}+cu{cuda_version}torch{torch_major_minor_version}"
+    # Version format: 1.2.0+devg1.0cu12.4torch2.4
+    version = f"{version}+{devg_version}cu{cuda_version}torch{torch_major_minor_version}"
 
     ROOT_DIR = os.path.dirname(__file__)
 
