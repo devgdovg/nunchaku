@@ -36,7 +36,9 @@ void gemm_w4a4(std::optional<torch::Tensor> act,            // packed act [M, K 
                std::optional<torch::Tensor> out_k, // packed attention [B, H, M, D]
                std::optional<torch::Tensor> out_v, // packed attention [B, H, M, D]
                int attn_tokens,
-               int rope_mode = 0) {
+               int rope_mode = 0,
+               int num_warps = 8,
+               bool stream_w = false) {
     TorchOpContext ctx;
     spdlog::trace("running gemm_w4a4: ");
 
@@ -78,7 +80,9 @@ void gemm_w4a4(std::optional<torch::Tensor> act,            // packed act [M, K 
                                  getTensor(out_k),
                                  getTensor(out_v),
                                  attn_tokens,
-                                 rope_mode);
+                                 rope_mode,
+                                 num_warps,
+                                 stream_w);
     // Tensor::synchronizeDevice();
 }
 
@@ -89,7 +93,9 @@ void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,
                                  std::optional<torch::Tensor> lora_act_out,
                                  std::optional<torch::Tensor> smooth,
                                  bool fuse_glu,
-                                 bool fp4) {
+                                 bool fp4,
+                                 int num_warps = 8,
+                                 bool stream_w = false) {
     TorchOpContext ctx;
 
     spdlog::trace("running quantize_w4a4_act_fuse_lora: ");
@@ -110,7 +116,9 @@ void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,
                                                    getTensor(lora_act_out),
                                                    getTensor(smooth),
                                                    fuse_glu,
-                                                   fp4);
+                                                   fp4,
+                                                   num_warps,
+                                                   stream_w);
 }
 
 void attention_fp16(torch::Tensor q, // packed [Batch, Head, TokensQ, HEAD_DIM]

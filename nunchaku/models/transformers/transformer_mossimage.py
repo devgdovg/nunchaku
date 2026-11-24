@@ -288,6 +288,8 @@ def _run_fused_qkv(
         smooth=linear.smooth_factor,
         fp4=linear.precision == "nvfp4",
         pad_size=256,
+        num_warps=linear.num_warps,
+        stream_w=linear.stream_w,
     )
     out = torch.empty(flat.shape[0], linear.out_features, dtype=flat.dtype, device=flat.device)
     svdq_gemm_w4a4_cuda(
@@ -306,6 +308,8 @@ def _run_fused_qkv(
         norm_k=k_norm.weight,
         rotary_emb=rope_cache.pack(rope),
         rope_mode=1,
+        num_warps=linear.num_warps,
+        stream_w=linear.stream_w,
     )
     return out.view(batch, seq_len, -1)
 
@@ -320,6 +324,8 @@ class NunchakuMOSSImageBlock(nn.Module):
         precision: str,
         rank: int,
         rope_cache: NunchakuMOSSImageRopeCache,
+        num_warps: int = 8,
+        stream_w: bool = False,
     ) -> None:
         super().__init__()
         self.heads = orig.heads
@@ -336,6 +342,9 @@ class NunchakuMOSSImageBlock(nn.Module):
                 "ffn_down": SVDQW4A4Linear.from_linear(orig.proj["ffn_down"], precision=precision, rank=rank),
             }
         )
+        for linear in self.proj.values():
+            linear.num_warps = num_warps
+            linear.stream_w = stream_w
 
     def _qkv_fused(self, y: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
         return _run_fused_qkv(y, rope, self.proj["qkv"], self.q_norm, self.k_norm, self.rope_cache)
@@ -363,6 +372,8 @@ class NunchakuMOSSImageTextBlock(nn.Module):
         precision: str,
         rank: int,
         rope_cache: NunchakuMOSSImageRopeCache,
+        num_warps: int = 8,
+        stream_w: bool = False,
     ) -> None:
         super().__init__()
         self.heads = orig.heads
@@ -375,6 +386,9 @@ class NunchakuMOSSImageTextBlock(nn.Module):
             ffn_up_gate = fuse_linears([orig.ffn_up, orig.ffn_gate])
         self.ffn_up_gate = SVDQW4A4Linear.from_linear(ffn_up_gate, precision=precision, rank=rank)
         self.ffn_down = SVDQW4A4Linear.from_linear(orig.ffn_down, precision=precision, rank=rank)
+        for linear in (self.qkv, self.proj, self.ffn_up_gate, self.ffn_down):
+            linear.num_warps = num_warps
+            linear.stream_w = stream_w
 
     def _qkv_fused(self, y: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
         return _run_fused_qkv(y, rope, self.qkv, self.q_norm, self.k_norm, self.rope_cache)
@@ -392,16 +406,28 @@ class NunchakuMOSSImageTextBlock(nn.Module):
 class NunchakuMOSSImageTransformer(MOSSImageTransformer, NunchakuModelLoaderMixin):
     """Nunchaku 量化版 MOSS-Image transformer。"""
 
-    def _patch_model(self, precision: str = "nvfp4", rank: int = 128):
+    def _patch_model(self, precision: str = "nvfp4", rank: int = 128, num_warps: int = 8, stream_w: bool = False):
+        if num_warps not in (8, 16):
+            raise ValueError(f"num_warps must be 8 or 16, got {num_warps!r}")
         self._rope_cache = NunchakuMOSSImageRopeCache()
         self.register_forward_pre_hook(self._clear_rope_cache)
         for index, block in enumerate(self.layers):
             self.layers[index] = NunchakuMOSSImageBlock(
-                block, precision=precision, rank=rank, rope_cache=self._rope_cache
+                block,
+                precision=precision,
+                rank=rank,
+                rope_cache=self._rope_cache,
+                num_warps=num_warps,
+                stream_w=stream_w,
             )
         for index, block in enumerate(self.text_embedder.blocks):
             self.text_embedder.blocks[index] = NunchakuMOSSImageTextBlock(
-                block, precision=precision, rank=rank, rope_cache=self._rope_cache
+                block,
+                precision=precision,
+                rank=rank,
+                rope_cache=self._rope_cache,
+                num_warps=num_warps,
+                stream_w=stream_w,
             )
         return self
 
@@ -412,6 +438,8 @@ class NunchakuMOSSImageTransformer(MOSSImageTransformer, NunchakuModelLoaderMixi
     @utils.validate_hf_hub_args
     def from_pretrained(cls, pretrained_model_name_or_path: str | os.PathLike[str], **kwargs: Any):
         device = kwargs.get("device", "cpu")
+        num_warps = int(kwargs.pop("num_warps", 8))
+        stream_w = bool(kwargs.pop("stream_w", False))
         torch_dtype = kwargs.get("torch_dtype", torch.bfloat16)
         if isinstance(pretrained_model_name_or_path, str):
             pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
@@ -431,7 +459,7 @@ class NunchakuMOSSImageTransformer(MOSSImageTransformer, NunchakuModelLoaderMixi
         precision = "nvfp4"
 
         transformer = transformer.to(torch_dtype)
-        transformer._patch_model(precision=precision, rank=rank)
+        transformer._patch_model(precision=precision, rank=rank, num_warps=num_warps, stream_w=stream_w)
         transformer = transformer.to_empty(device=device)
         if "rope.bands" not in state_dict:
             state_dict["rope.bands"] = transformer.rope._default_bands(transformer.rope.bands.device)

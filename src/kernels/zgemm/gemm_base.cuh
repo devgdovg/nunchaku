@@ -26,7 +26,7 @@
 
 namespace nunchaku::kernels {
 
-template<bool bf16, bool faster_i2f = false>
+template<bool bf16, bool faster_i2f = false, int num_warps = 8, bool stream_w = false>
 class GEMMConfig_W4A4 {
 public:
     // BE CAREFUL: weights need to be repacked when the tiling size changes
@@ -34,7 +34,10 @@ public:
     static constexpr int BLOCK_M   = 256;
     static constexpr int BLOCK_N   = 128;
     static constexpr int WARP_SIZE = 32;
-    static constexpr int NUM_WARPS = 8;
+    static constexpr int NUM_WARPS = num_warps;
+    static constexpr bool STREAM_W = stream_w;
+
+    static_assert(BLOCK_M % NUM_WARPS == 0);
 
     static constexpr int INSN_M = 16;
     static constexpr int INSN_N = 16;
@@ -51,6 +54,9 @@ public:
 using GEMMConfig_W4A4_FP16           = GEMMConfig_W4A4<false>;
 using GEMMConfig_W4A4_BF16           = GEMMConfig_W4A4<true>;
 using GEMMConfig_W4A4_FP16_FasterI2F = GEMMConfig_W4A4<false, true>;
+// MOSS Image 4x256 M-only experiment: 16 warps, 16 M rows per warp.
+using GEMMConfig_W4A4_BF16_MOSS16     = GEMMConfig_W4A4<true, false, 16, true>;
+using GEMMConfig_W4A4_BF16_8W_STREAM  = GEMMConfig_W4A4<true, false, 8, true>;
 
 class GEMMConfig_W8A8 {
 public:
@@ -498,8 +504,13 @@ public:
 
         // F (int rowId, pack_t &pack)
         template<typename... F>
-        __device__ __forceinline__ void operator()(
-            fpsum_warp fpsum, half_t *output, int stride, int maxRows, int maxCols, void *shmem, F &&...plugins) {
+        __device__ __forceinline__ void operator()(const fpsum_warp &fpsum,
+                                                   half_t *output,
+                                                   int stride,
+                                                   int maxRows,
+                                                   int maxCols,
+                                                   void *shmem,
+                                                   F &&...plugins) {
             const int laneId = threadIdx.x % WARP_SIZE;
 
             matrix_t &mat = *reinterpret_cast<matrix_t *>(shmem);
@@ -523,7 +534,7 @@ public:
             for (int i = 0; i < WARP_M_TILES; i++) {
 #pragma unroll
                 for (int j = 0; j < WARP_N_TILES; j++) {
-                    packed_fpsum_t &fsum                             = fpsum[i * WARP_N_TILES + j];
+                    const packed_fpsum_t &fsum                       = fpsum[i * WARP_N_TILES + j];
                     int row                                          = laneId / 4;
                     int col                                          = laneId % 4 * 2 + j * INSN_N;
                     *reinterpret_cast<half2_t *>(&mat[row][col + 0]) = fsum.data[0];
@@ -552,7 +563,7 @@ public:
 
 #pragma unroll
                 for (int j = 0; j < WARP_N_TILES; j++) {
-                    packed_fpsum_t &fsum                             = fpsum[i * WARP_N_TILES + j];
+                    const packed_fpsum_t &fsum                       = fpsum[i * WARP_N_TILES + j];
                     int row                                          = laneId / 4;
                     int col                                          = laneId % 4 * 2 + j * INSN_N;
                     *reinterpret_cast<half2_t *>(&mat[row][col + 0]) = fsum.data[1];
@@ -671,7 +682,7 @@ public:
         };
 
         __device__ __forceinline__ void
-        operator()(const BlockInfo binfo, fpsum_warp fpsum, int M, int N, int K, const Arguments &args) {
+        operator()(const BlockInfo binfo, const fpsum_warp &fpsum, int M, int N, int K, const Arguments &args) {
             const int warpId = threadIdx.x / WARP_SIZE;
 
             __shared__ alignas(128) uint8_t shmem[NUM_WARPS][ceilDiv(unpack_fpsum::SHMEM_SIZE, 128) * 128];

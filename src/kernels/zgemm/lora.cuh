@@ -58,6 +58,15 @@ public:
         });
     }
 
+    __device__ __forceinline__ static packed_fpsum_t load_lora_wgt_tile(
+        const packed_fpsum_t *ptr, int rtile, int n_tile, int rank, bool pred) {
+        const int laneId = threadIdx.x % WARP_SIZE;
+        const packed_fpsum_t *ptr_lane = &ptr[rtile * LORA_R_TILES * WARP_SIZE + laneId];
+        const int stride_ntile         = rank / 16 * WARP_SIZE;
+        static_assert(LORA_R_TILES == 1, "streaming lora_wgt currently supports LORA_R_TILES == 1");
+        return load_pred(ptr_lane + n_tile * stride_ntile, pred);
+    }
+
     // lora_act: [M / BLOCK_M, rank / WARP_R, NUM_WARPS, LORA_M_TILES, LORA_R_TILES, 8, WARP_SIZE] of float
     __device__ __forceinline__ static void
     load_lora_act(const float *ptr, int rtile, lora_act_warp &result, bool pred) {
@@ -118,12 +127,12 @@ public:
             bool alwaysfalse;
         };
 
-        __device__ __forceinline__ static void apply_lora_up(fpsum_warp &fpsum,
-                                                             const float *act,
-                                                             const packed_fpsum_t *wgt,
-                                                             const scale_t &scales,
-                                                             int rank,
-                                                             bool alwaysfalse) {
+        __device__ __forceinline__ static fpsum_warp apply_lora_up(const fpsum_warp &fpsum,
+                                                                   const float *act,
+                                                                   const packed_fpsum_t *wgt,
+                                                                   const scale_t &scales,
+                                                                   int rank,
+                                                                   bool alwaysfalse) {
             constexpr int NUM_STAGES = 2;
 
             const int laneId = threadIdx.x % WARP_SIZE;
@@ -218,7 +227,65 @@ public:
 
             unused_var(dummy, alwaysfalse);
 
-            fpsum = packed_fp32_to_fp16(f32psum);
+            return packed_fp32_to_fp16(f32psum);
+        }
+
+        __device__ __forceinline__ static fpsum_warp apply_lora_up_stream(const fpsum_warp &fpsum,
+                                                                          const float *act,
+                                                                          const packed_fpsum_t *wgt,
+                                                                          const scale_t &scales,
+                                                                          int rank,
+                                                                          bool alwaysfalse) {
+            constexpr int NUM_STAGES = 2;
+
+            lora_act_warp lora_act[NUM_STAGES];
+            f32psum_warp f32psum = packed_fp16_to_fp32(fpsum);
+
+#pragma unroll
+            for (int k = 0; k < NUM_STAGES - 1; k++) {
+                load_lora_act(act, 0, lora_act[k], k == 0);
+            }
+
+            for (int r = 0; r < rank / WARP_R; r++) {
+                const int next_r = r + NUM_STAGES - 1;
+                const int idx    = next_r % NUM_STAGES;
+                const bool pred  = next_r < rank / WARP_R;
+                load_lora_act(act, next_r, lora_act[idx], pred);
+
+                lora_act16_warp A_fp16;
+                for (int m = 0; m < LORA_M_TILES; m++) {
+                    for (int rr = 0; rr < LORA_R_TILES; rr++) {
+                        packed_f32psum_t pack = lora_act[r % NUM_STAGES][m * LORA_R_TILES + rr];
+#pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            pack.data[j] *= scales[r * LORA_R_TILES + rr];
+                        }
+                        A_fp16[m * LORA_R_TILES + rr] = packed_fp32_to_fp16(pack);
+                    }
+                }
+
+                packed_fpsum_t wcur = load_lora_wgt_tile(wgt, r, 0, rank, true);
+                for (int n = 0; n < LORA_N_TILES; n++) {
+                    const bool load_next = n + 1 < LORA_N_TILES;
+                    packed_fpsum_t wnext;
+                    if (load_next) {
+                        wnext = load_lora_wgt_tile(wgt, r, n + 1, rank, true);
+                    }
+
+                    for (int m = 0; m < LORA_M_TILES; m++) {
+                        for (int rr = 0; rr < LORA_R_TILES; rr++) {
+                            f32psum[m * WARP_N_TILES + n] = mma_f16xf16_f32(
+                                A_fp16[m * LORA_R_TILES + rr], wcur, f32psum[m * WARP_N_TILES + n]);
+                        }
+                    }
+                    if (load_next) {
+                        wcur = wnext;
+                    }
+                }
+            }
+
+            (void)alwaysfalse;
+            return packed_fp32_to_fp16(f32psum);
         }
 
         __device__ __forceinline__ void
@@ -228,13 +295,25 @@ public:
 
             CHECK_NAN(fpsum, "fpsum");
 
-            apply_lora_up(fpsum,
-                          args.lora_act +
-                              bm * (args.rank / WARP_R) * (NUM_WARPS * LORA_M_TILES * LORA_R_TILES * 8 * WARP_SIZE),
-                          args.lora_wgt_up + bn * (BLOCK_N / 16) * (args.rank / 16) * WARP_SIZE,
-                          args.scales,
-                          args.rank,
-                          args.alwaysfalse);
+            if constexpr (Config::STREAM_W) {
+                fpsum = apply_lora_up_stream(
+                    fpsum,
+                    args.lora_act +
+                        bm * (args.rank / WARP_R) * (NUM_WARPS * LORA_M_TILES * LORA_R_TILES * 8 * WARP_SIZE),
+                    args.lora_wgt_up + bn * (BLOCK_N / 16) * (args.rank / 16) * WARP_SIZE,
+                    args.scales,
+                    args.rank,
+                    args.alwaysfalse);
+            } else {
+                fpsum = apply_lora_up(
+                    fpsum,
+                    args.lora_act +
+                        bm * (args.rank / WARP_R) * (NUM_WARPS * LORA_M_TILES * LORA_R_TILES * 8 * WARP_SIZE),
+                    args.lora_wgt_up + bn * (BLOCK_N / 16) * (args.rank / 16) * WARP_SIZE,
+                    args.scales,
+                    args.rank,
+                    args.alwaysfalse);
+            }
 
             CHECK_NAN(fpsum, "fpsum");
         }
@@ -251,7 +330,7 @@ public:
         };
 
         __device__ __forceinline__ static void
-        apply_lora_down(fpsum_warp &fpsum, float *act, const packed_fpsum_t *wgt, int rank, bool alwaysfalse) {
+        apply_lora_down(const fpsum_warp &fpsum, float *act, const packed_fpsum_t *wgt, int rank, bool alwaysfalse) {
             constexpr int NUM_STAGES = 2;
 
             const int laneId = threadIdx.x % WARP_SIZE;
@@ -338,17 +417,58 @@ public:
             unused_var(dummy, alwaysfalse);
         }
 
+        __device__ __forceinline__ static void
+        apply_lora_down_stream(const fpsum_warp &fpsum, float *act, const packed_fpsum_t *wgt, int rank, bool alwaysfalse) {
+            for (int r = 0; r < rank / WARP_R; r++) {
+                lora_act_warp lora_act;
+                lora_act.fill(packed_f32psum_t::zeros());
+
+                packed_fpsum_t wcur = load_lora_wgt_tile(wgt, r, 0, rank, true);
+                for (int n = 0; n < LORA_N_TILES; n++) {
+                    const bool load_next = n + 1 < LORA_N_TILES;
+                    packed_fpsum_t wnext;
+                    if (load_next) {
+                        wnext = load_lora_wgt_tile(wgt, r, n + 1, rank, true);
+                    }
+
+                    for (int m = 0; m < LORA_M_TILES; m++) {
+                        for (int rr = 0; rr < LORA_R_TILES; rr++) {
+                            lora_act[m * LORA_R_TILES + rr] = mma_f16xf16_f32(
+                                fpsum[m * WARP_N_TILES + n], wcur, lora_act[m * LORA_R_TILES + rr]);
+                        }
+                    }
+                    if (load_next) {
+                        wcur = wnext;
+                    }
+                }
+
+                reduce_lora_act(act, r, lora_act, true);
+            }
+
+            (void)alwaysfalse;
+        }
+
         __device__ __forceinline__ void
-        operator()(const BlockInfo binfo, fpsum_warp &fpsum, int M, int N, int K, const Arguments &args) {
+        operator()(const BlockInfo binfo, const fpsum_warp &fpsum, int M, int N, int K, const Arguments &args) {
             const int bm = binfo.bm;
             const int bn = binfo.bn;
 
-            apply_lora_down(fpsum,
-                            args.lora_act +
-                                bm * (args.rank / WARP_R) * (NUM_WARPS * LORA_M_TILES * LORA_R_TILES * 8 * WARP_SIZE),
-                            args.lora_wgt_down + bn * (BLOCK_N / 16) * (args.rank / 16) * WARP_SIZE,
-                            args.rank,
-                            args.alwaysfalse);
+            if constexpr (Config::STREAM_W) {
+                apply_lora_down_stream(
+                    fpsum,
+                    args.lora_act +
+                        bm * (args.rank / WARP_R) * (NUM_WARPS * LORA_M_TILES * LORA_R_TILES * 8 * WARP_SIZE),
+                    args.lora_wgt_down + bn * (BLOCK_N / 16) * (args.rank / 16) * WARP_SIZE,
+                    args.rank,
+                    args.alwaysfalse);
+            } else {
+                apply_lora_down(fpsum,
+                                args.lora_act +
+                                    bm * (args.rank / WARP_R) * (NUM_WARPS * LORA_M_TILES * LORA_R_TILES * 8 * WARP_SIZE),
+                                args.lora_wgt_down + bn * (BLOCK_N / 16) * (args.rank / 16) * WARP_SIZE,
+                                args.rank,
+                                args.alwaysfalse);
+            }
         }
     };
 };

@@ -40,6 +40,8 @@ def svdq_gemm_w4a4_cuda(
     out_v: torch.Tensor | None = None,
     attn_tokens: int = 0,
     rope_mode: int = 0,
+    num_warps: int = 8,
+    stream_w: bool = False,
 ):
     """
     Quantized GEMM using SVDQuant W4A4 CUDA kernel, with support for LoRA, rotary embeddings, normalization, and fused activations.
@@ -163,4 +165,6 @@ def svdq_gemm_w4a4_cuda(
         out_v,
         attn_tokens,
         rope_mode,
+        num_warps,
+        stream_w,
     )

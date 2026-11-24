@@ -18,6 +18,8 @@ def svdq_quantize_w4a4_act_fuse_lora_cuda(
     fuse_glu: bool = False,
     fp4: bool = False,
     pad_size: int = 256,
+    num_warps: int = 8,
+    stream_w: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Quantizes activations and computes LoRA down-projection using SVDQuant W4A4 CUDA kernel.
@@ -77,5 +79,7 @@ def svdq_quantize_w4a4_act_fuse_lora_cuda(
     if lora_act_out is None:
         lora_act_out = torch.empty(batch_size_pad, rank, dtype=torch.float32, device=input.device)
 
-    ops.quantize_w4a4_act_fuse_lora(input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4)
+    ops.quantize_w4a4_act_fuse_lora(
+        input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4, num_warps, stream_w
+    )
     return output, oscales, lora_act_out

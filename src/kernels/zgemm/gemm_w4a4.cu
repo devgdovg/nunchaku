@@ -15,8 +15,16 @@ struct FasterI2FMode {
 };
 
 template<typename F>
-static void invoke_launch(Tensor::ScalarType dtype, bool use_fp4, bool fasterI2F, F &&launch) {
-    if (fasterI2F && dtype == Tensor::FP16) {
+static void invoke_launch(
+    Tensor::ScalarType dtype, bool use_fp4, bool fasterI2F, int num_warps, bool stream_w, F &&launch) {
+    if (num_warps == 16) {
+        assert(use_fp4);
+        assert(dtype == Tensor::BF16);
+        launch.template operator()<GEMMConfig_W4A4_BF16_MOSS16, true>();
+    } else if (stream_w && dtype == Tensor::BF16) {
+        assert(use_fp4);
+        launch.template operator()<GEMMConfig_W4A4_BF16_8W_STREAM, true>();
+    } else if (fasterI2F && dtype == Tensor::FP16) {
         launch.template operator()<GEMMConfig_W4A4_FP16_FasterI2F, false>();
     } else {
         dispatchBool(use_fp4, [&]<bool USE_FP4>() {
@@ -60,7 +68,9 @@ void gemm_w4a4(Tensor act,            // packed act [M, K / 2]
                Tensor out_k, // packed attention [B, H, M, D]
                Tensor out_v, // packed attention [B, H, M, D]
                int attn_tokens,
-               int rope_mode) {
+               int rope_mode,
+               int num_warps,
+               bool stream_w) {
     Tensor::ScalarType dtype = Tensor::INVALID_SCALAR_TYPE;
     if (!fp4) {
         dtype = ascales.dtype();
@@ -72,7 +82,7 @@ void gemm_w4a4(Tensor act,            // packed act [M, K / 2]
             }
         }
     }
-    invoke_launch(dtype, fp4, FasterI2FMode::check(act_unsigned), [&]<typename Config, bool USE_FP4>() {
+    invoke_launch(dtype, fp4, FasterI2FMode::check(act_unsigned), num_warps, stream_w, [&]<typename Config, bool USE_FP4>() {
         GEMM_W4A4_Launch<Config, USE_FP4>::gemm_w4a4(act,
                                                      wgt,
                                                      out,
@@ -107,7 +117,7 @@ void gemm_w4a4(Tensor act,            // packed act [M, K / 2]
 }
 
 void linearattn_vk_mul_q(Tensor q, Tensor vk) {
-    invoke_launch(q.dtype(), false, false, [&]<typename Config, bool USE_FP4>() {
+    invoke_launch(q.dtype(), false, false, 8, false, [&]<typename Config, bool USE_FP4>() {
         GEMM_W4A4_Launch<Config, false>::linearattn_vk_mul_q(q, vk);
     });
 }
@@ -119,20 +129,22 @@ void quantize_w4a4_act_fuse_lora(Tensor input,
                                  Tensor lora_act_out,
                                  Tensor smooth,
                                  bool fuse_glu,
-                                 bool fp4) {
-    invoke_launch(input.dtype(), fp4, false, [&]<typename Config, bool USE_FP4>() {
+                                 bool fp4,
+                                 int num_warps,
+                                 bool stream_w) {
+    invoke_launch(input.dtype(), fp4, false, num_warps, stream_w, [&]<typename Config, bool USE_FP4>() {
         GEMM_W4A4_Launch<Config, USE_FP4>::quantize_w4a4_act_fuse_lora(
             input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4);
     });
 }
 
 void quantize_w4a4_act(Tensor input, Tensor output, Tensor oscales) {
-    invoke_launch(input.dtype(), false, false, [&]<typename Config, bool USE_FP4>() {
+    invoke_launch(input.dtype(), false, false, 8, false, [&]<typename Config, bool USE_FP4>() {
         GEMM_W4A4_Launch<Config, false>::quantize_w4a4_act(input, output, oscales);
     });
 }
 void quantize_w4a4_wgt(Tensor input, Tensor output, Tensor oscales) {
-    invoke_launch(input.dtype(), false, false, [&]<typename Config, bool USE_FP4>() {
+    invoke_launch(input.dtype(), false, false, 8, false, [&]<typename Config, bool USE_FP4>() {
         GEMM_W4A4_Launch<Config, false>::quantize_w4a4_wgt(input, output, oscales);
     });
 }

@@ -41,14 +41,14 @@ public:
     }
 
     static_assert(WARP_N % 32 == 0);
-    static_assert(WARP_M % 32 == 0);
+    static_assert(WARP_M % INSN_M == 0);
 
     static constexpr int WMSCALES_PACK_SIZE   = clamp(WARP_N / 32, 1, 4);
     static constexpr int WMSCALES_NUM_PACKS   = ceilDiv(WARP_N / 32, WMSCALES_PACK_SIZE);
     static constexpr int WMSCALES_VALID_LANES = WARP_SIZE;
 
-    static constexpr int AMSCALES_PACK_SIZE   = clamp(WARP_M / 32, 1, 4);
-    static constexpr int AMSCALES_NUM_PACKS   = ceilDiv(WARP_M / 32, AMSCALES_PACK_SIZE);
+    static constexpr int AMSCALES_PACK_SIZE   = clamp(ceilDiv(WARP_M, 32), 1, 4);
+    static constexpr int AMSCALES_NUM_PACKS   = ceilDiv(WARP_M, AMSCALES_PACK_SIZE * WARP_SIZE);
     static constexpr int AMSCALES_VALID_LANES = WARP_SIZE;
 
     struct packed_wmscale_t {
@@ -249,24 +249,36 @@ public:
         return out;
     }
 
+    __device__ __forceinline__ static void load_wgt_tile(
+        const packed_wgt_t *wgt, int k, int j, packed_wgt_t &out, bool pred) {
+        const int laneId = threadIdx.x % WARP_SIZE;
+        out = load_pred(&wgt[(k * WARP_N_TILES + j) * WARP_SIZE + laneId], pred);
+    }
+
+    __device__ __forceinline__ static void compute_fp4_tile(const act_warp &A,
+                                                            const packed_wgt_t &Wj,
+                                                            int j,
+                                                            const amscale_warp &amscale,
+                                                            const wmscale_warp &wmscale,
+                                                            f32psum_warp &psum) {
+#pragma unroll
+        for (int i = 0; i < WARP_M_TILES; i++) {
+            psum[i * WARP_N_TILES + j] =
+                mma_fp4(A[i],
+                        Wj,
+                        psum[i * WARP_N_TILES + j],
+                        amscale[i / 2 / AMSCALES_PACK_SIZE].data[i / 2 % AMSCALES_PACK_SIZE],
+                        wmscale[j / 2 / WMSCALES_PACK_SIZE].data[j / 2 % WMSCALES_PACK_SIZE],
+                        i % 2,
+                        j % 2);
+        }
+    }
+
     __device__ __forceinline__ static void
     compute_fp4(act_warp A, wgt_warp W, amscale_warp amscale, wmscale_warp wmscale, f32psum_warp &psum) {
-        const int laneId = threadIdx.x % WARP_SIZE;
-        const int warpId = threadIdx.x / WARP_SIZE;
-
 #pragma unroll
         for (int j = 0; j < WARP_N_TILES; j++) {
-#pragma unroll
-            for (int i = 0; i < WARP_M_TILES; i++) {
-                psum[i * WARP_N_TILES + j] =
-                    mma_fp4(A[i],
-                            W[j],
-                            psum[i * WARP_N_TILES + j],
-                            amscale[i / 2 / AMSCALES_PACK_SIZE].data[i / 2 % AMSCALES_PACK_SIZE],
-                            wmscale[j / 2 / WMSCALES_PACK_SIZE].data[j / 2 % WMSCALES_PACK_SIZE],
-                            i % 2,
-                            j % 2);
-            }
+            compute_fp4_tile(A, W[j], j, amscale, wmscale, psum);
         }
     }
 
@@ -356,6 +368,92 @@ public:
     }
 
     template<typename Epilogue, bool USE_ALPHA>
+    __device__ __forceinline__ static void gemm_w4a4_fp4_block_stream(const BlockInfo binfo,
+                                                                      const packed_act_t *act,
+                                                                      const packed_wgt_t *wgt,
+                                                                      const packed_amscale_t *ascales,
+                                                                      const packed_wmscale_t *wscales,
+                                                                      float alpha,
+                                                                      int M,
+                                                                      int N,
+                                                                      int K,
+                                                                      const Epilogue::Arguments &epilogueArgs,
+                                                                      bool alwaysfalse) {
+        constexpr int NUM_STAGES = 2;
+
+        act_warp A[NUM_STAGES];
+        amscale_warp amscale[NUM_STAGES];
+        wmscale_warp wmscale[NUM_STAGES];
+        f32psum_warp fpsum;
+
+        for (int k = 0; k < NUM_STAGES - 1; k++) {
+            load_act(act, k, K, A[k], true);
+            load_amscale(ascales, k, amscale[k], true);
+            load_wmscale(wscales, k, wmscale[k], true);
+        }
+
+#pragma unroll
+        for (auto &pack : fpsum) {
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                pack.data[i] = 0;
+            }
+        }
+
+        int dummy = 0;
+
+        for (int k1 = 0; k1 < K / WARP_K; k1 += NUM_STAGES) {
+#pragma unroll
+            for (int k2 = 0; k2 < NUM_STAGES; k2++) {
+                int nextk = k1 + k2 + NUM_STAGES - 1;
+                int idx   = (k2 + NUM_STAGES - 1) % NUM_STAGES;
+                bool pred = nextk < K / WARP_K;
+                load_act(act, nextk, K, A[idx], pred);
+                load_amscale(ascales, nextk, amscale[idx], pred);
+                load_wmscale(wscales, nextk, wmscale[idx], pred);
+
+                const int current_k = k1 + k2;
+                packed_wgt_t wcur, wnext;
+                load_wgt_tile(wgt, current_k, 0, wcur, current_k < K / WARP_K);
+
+#pragma unroll
+                for (int j = 0; j < WARP_N_TILES; j++) {
+                    const bool load_next = j + 1 < WARP_N_TILES;
+                    if (load_next) {
+                        load_wgt_tile(wgt, current_k, j + 1, wnext, current_k < K / WARP_K);
+                    }
+
+                    compute_fp4_tile(A[k2], wcur, j, amscale[k2], wmscale[k2], fpsum);
+
+                    if (load_next) {
+                        wcur = wnext;
+                    }
+                }
+
+                if (alwaysfalse) {
+                    dummy = clock();
+                }
+            }
+        }
+
+        unused_var(dummy, alwaysfalse);
+
+        if constexpr (USE_ALPHA) {
+#pragma unroll
+            for (auto &pack : fpsum) {
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    pack.data[i] *= alpha;
+                }
+            }
+        }
+
+        auto f16psum = packed_fp32_to_fp16(fpsum);
+        CHECK_NAN(f16psum, "f16psum");
+        Epilogue()(binfo, f16psum, M, N, K, epilogueArgs);
+    }
+
+    template<typename Epilogue, bool USE_ALPHA>
     struct gemm_w4a4_fp4_kernel {
         static constexpr int MIN_ARCH = 1200;
         __device__ void operator()(const packed_act_t *act,
@@ -385,19 +483,33 @@ public:
             const int bn = binfo.bn;
 
             if constexpr (FP4_AVAILABLE) {
-                gemm_w4a4_fp4_block<Epilogue, USE_ALPHA>(
-                    binfo,
-                    act + bm * (K / WARP_K) * NUM_WARPS * WARP_M_TILES * WARP_SIZE,
-                    wgt + bn * (K / WARP_K) * WARP_N_TILES * WARP_SIZE,
-                    ascales + bm * (K / WARP_K) * NUM_WARPS * AMSCALES_NUM_PACKS * AMSCALES_VALID_LANES,
-                    wscales + bn * (K / WARP_K) * WMSCALES_NUM_PACKS * WMSCALES_VALID_LANES,
-                    alpha,
-                    M,
-                    N,
-                    K,
-                    epilogueArgs,
-                    alwaysfalse);
-
+                if constexpr (Config::STREAM_W) {
+                    gemm_w4a4_fp4_block_stream<Epilogue, USE_ALPHA>(
+                        binfo,
+                        act + bm * (K / WARP_K) * NUM_WARPS * WARP_M_TILES * WARP_SIZE,
+                        wgt + bn * (K / WARP_K) * WARP_N_TILES * WARP_SIZE,
+                        ascales + bm * (K / WARP_K) * NUM_WARPS * AMSCALES_NUM_PACKS * AMSCALES_VALID_LANES,
+                        wscales + bn * (K / WARP_K) * WMSCALES_NUM_PACKS * WMSCALES_VALID_LANES,
+                        alpha,
+                        M,
+                        N,
+                        K,
+                        epilogueArgs,
+                        alwaysfalse);
+                } else {
+                    gemm_w4a4_fp4_block<Epilogue, USE_ALPHA>(
+                        binfo,
+                        act + bm * (K / WARP_K) * NUM_WARPS * WARP_M_TILES * WARP_SIZE,
+                        wgt + bn * (K / WARP_K) * WARP_N_TILES * WARP_SIZE,
+                        ascales + bm * (K / WARP_K) * NUM_WARPS * AMSCALES_NUM_PACKS * AMSCALES_VALID_LANES,
+                        wscales + bn * (K / WARP_K) * WMSCALES_NUM_PACKS * WMSCALES_VALID_LANES,
+                        alpha,
+                        M,
+                        N,
+                        K,
+                        epilogueArgs,
+                        alwaysfalse);
+                }
             } else {
                 trap_no_fp4();
             }

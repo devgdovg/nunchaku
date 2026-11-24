@@ -177,6 +177,7 @@ if __name__ == "__main__":
             "src/kernels/zgemm/gemm_w4a4_launch_fp16_fp4.cu",
             "src/kernels/zgemm/gemm_w4a4_launch_bf16_int4.cu",
             "src/kernels/zgemm/gemm_w4a4_launch_bf16_fp4.cu",
+            "src/kernels/zgemm/gemm_w4a4_launch_bf16_fp4_moss16.cu",
             "src/kernels/zgemm/gemm_w8a8.cu",
             "src/kernels/zgemm/attention.cu",
             "src/kernels/dwconv.cu",
