@@ -379,7 +379,8 @@ public:
                                                                       int K,
                                                                       const Epilogue::Arguments &epilogueArgs,
                                                                       bool alwaysfalse) {
-        constexpr int NUM_STAGES = 2;
+        // MOSS 16-warp residency experiment: use a single stage for A/scales.
+        constexpr int NUM_STAGES = NUM_WARPS == 16 ? 1 : 2;
 
         act_warp A[NUM_STAGES];
         amscale_warp amscale[NUM_STAGES];
@@ -413,20 +414,29 @@ public:
                 load_wmscale(wscales, nextk, wmscale[idx], pred);
 
                 const int current_k = k1 + k2;
-                packed_wgt_t wcur, wnext;
-                load_wgt_tile(wgt, current_k, 0, wcur, current_k < K / WARP_K);
+                if constexpr (NUM_WARPS == 16) {
+                    packed_wgt_t wcur;
+#pragma unroll
+                    for (int j = 0; j < WARP_N_TILES; j++) {
+                        load_wgt_tile(wgt, current_k, j, wcur, current_k < K / WARP_K);
+                        compute_fp4_tile(A[k2], wcur, j, amscale[k2], wmscale[k2], fpsum);
+                    }
+                } else {
+                    packed_wgt_t wcur, wnext;
+                    load_wgt_tile(wgt, current_k, 0, wcur, current_k < K / WARP_K);
 
 #pragma unroll
-                for (int j = 0; j < WARP_N_TILES; j++) {
-                    const bool load_next = j + 1 < WARP_N_TILES;
-                    if (load_next) {
-                        load_wgt_tile(wgt, current_k, j + 1, wnext, current_k < K / WARP_K);
-                    }
+                    for (int j = 0; j < WARP_N_TILES; j++) {
+                        const bool load_next = j + 1 < WARP_N_TILES;
+                        if (load_next) {
+                            load_wgt_tile(wgt, current_k, j + 1, wnext, current_k < K / WARP_K);
+                        }
 
-                    compute_fp4_tile(A[k2], wcur, j, amscale[k2], wmscale[k2], fpsum);
+                        compute_fp4_tile(A[k2], wcur, j, amscale[k2], wmscale[k2], fpsum);
 
-                    if (load_next) {
-                        wcur = wnext;
+                        if (load_next) {
+                            wcur = wnext;
+                        }
                     }
                 }
 
