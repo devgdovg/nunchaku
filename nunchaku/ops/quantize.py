@@ -72,7 +72,16 @@ def svdq_quantize_w4a4_act_fuse_lora_cuda(
     if oscales is None:
         if fp4:
             assert channels % 16 == 0
-            oscales = torch.empty(channels // 16, batch_size_pad, dtype=torch.float8_e4m3fn, device=input.device)
+            # 16-warp M-only uses 16 warps with WARP_M=16; the activation-scale
+            # layout still has 32 lanes per warp, so its backing storage is 2x
+            # the 8-warp layout.
+            scale_factor = 2 if num_warps == 16 else 1
+            oscales = torch.empty(
+                channels // 16 * scale_factor,
+                batch_size_pad,
+                dtype=torch.float8_e4m3fn,
+                device=input.device,
+            )
         else:
             assert channels % 64 == 0
             oscales = torch.empty(channels // 64, batch_size_pad, dtype=input.dtype, device=input.device)

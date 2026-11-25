@@ -479,7 +479,8 @@ void GEMM_W4A4_Launch<Config, USE_FP4>::quantize_w4a4_act_fuse_lora(Tensor input
     // assert(oscales.dtype() == Tensor::FP16);
     if (fp4) {
         assert(oscales.dtype() == Tensor::FP8_E4M3);
-        assert(oscales.numel() == M * N / GEMM::WARP_K * 4);
+        constexpr int scale_factor = GEMM::NUM_WARPS == 16 ? 2 : 1;
+        assert(oscales.numel() == M * N / GEMM::WARP_K * 4 * scale_factor);
     } else {
         assert(isTypeMatch<half_t>(oscales.dtype()));
         assert(oscales.numel() == M * N / GEMM::WARP_K);
