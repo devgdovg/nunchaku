@@ -60,7 +60,9 @@ void gemm_w4a4(Tensor act,            // packed act [M, K / 2]
                Tensor out_k, // packed attention [B, H, M, D]
                Tensor out_v, // packed attention [B, H, M, D]
                int attn_tokens,
-               int rope_mode) {
+               int rope_mode,
+               Tensor residual,
+               Tensor gate) {
     Tensor::ScalarType dtype = Tensor::INVALID_SCALAR_TYPE;
     if (!fp4) {
         dtype = ascales.dtype();
@@ -102,7 +104,9 @@ void gemm_w4a4(Tensor act,            // packed act [M, K / 2]
                                                      out_k,
                                                      out_v,
                                                      attn_tokens,
-                                                     rope_mode);
+                                                     rope_mode,
+                                                     residual,
+                                                     gate);
     });
 }
 

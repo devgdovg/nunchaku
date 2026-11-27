@@ -38,7 +38,9 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
     Tensor out_k,    // packed attention [B, H, M, D]
     Tensor out_v,    // packed attention [B, H, M, D]
     int attn_tokens,
-    int rope_mode) {
+    int rope_mode,
+    Tensor residual, // [M, N], for gated residual epilogue
+    Tensor gate) {   // [N], for gated residual epilogue
 #ifdef __INTELLISENSE__
     static constexpr bool USE_FP4 = false;
 #endif
@@ -416,17 +418,38 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
 
     } else if (out.valid()) {
 
-        using Epilogue = typename GEMM::EpilogueDefault;
-        typename Epilogue::Arguments args{
-            .out     = out.data_ptr<half_t>(),
-            .actualM = actualM,
-            .actualN = actualN,
-        };
+        assert(residual.valid() == gate.valid());
 
-        if (fuse_silu) {
-            launch_lora.template operator()<Epilogue, typename GEMM::EpilogueSilu>(args, {});
-        } else {
+        if (residual.valid()) {
+            assert(!fuse_silu);
+            assert(isTypeMatch<half_t>(residual.scalar_type()));
+            assert(isTypeMatch<half_t>(gate.scalar_type()));
+            assert(residual.numel() == out.numel());
+            assert(gate.numel() == actualN);
+
+            using Epilogue = typename Epilogues::EpilogueGatedResidual;
+            typename Epilogue::Arguments args{
+                .residual = residual.data_ptr<half_t>(),
+                .gate     = gate.data_ptr<half_t>(),
+                .out      = out.data_ptr<half_t>(),
+                .actualM  = actualM,
+                .actualN  = actualN,
+            };
+
             launch_lora.template operator()<Epilogue, typename GEMM::EpilogueNop>(args, {});
+        } else {
+            using Epilogue = typename GEMM::EpilogueDefault;
+            typename Epilogue::Arguments args{
+                .out     = out.data_ptr<half_t>(),
+                .actualM = actualM,
+                .actualN = actualN,
+            };
+
+            if (fuse_silu) {
+                launch_lora.template operator()<Epilogue, typename GEMM::EpilogueSilu>(args, {});
+            } else {
+                launch_lora.template operator()<Epilogue, typename GEMM::EpilogueNop>(args, {});
+            }
         }
     } else {
         assert(false);

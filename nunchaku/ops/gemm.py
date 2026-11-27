@@ -164,3 +164,47 @@ def svdq_gemm_w4a4_cuda(
         attn_tokens,
         rope_mode,
     )
+
+
+def svdq_gemm_w4a4_gated_residual_cuda(
+    act: torch.Tensor,
+    wgt: torch.Tensor,
+    out: torch.Tensor,
+    ascales: torch.Tensor,
+    wscales: torch.Tensor,
+    lora_act_in: torch.Tensor,
+    lora_up: torch.Tensor,
+    wcscales: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    fp4: bool = True,
+    alpha: float | None = 1.0,
+):
+    """W4A4 GEMM with the MOSS gated-residual epilogue.
+
+    Computes ``out = residual + gemm(act, wgt) * gate`` in the phase 2 epilogue.
+    ``gate`` is a per-sample vector broadcast over tokens.
+    """
+    if alpha is None:
+        alpha = 1.0
+    if gate.ndim != 1:
+        gate = gate.reshape(-1)
+    if not gate.is_contiguous():
+        gate = gate.contiguous()
+    if not residual.is_contiguous():
+        residual = residual.contiguous()
+
+    ops.gemm_w4a4_gated_residual(
+        act,
+        wgt,
+        out,
+        ascales,
+        wscales,
+        lora_act_in,
+        lora_up,
+        wcscales,
+        residual,
+        gate,
+        fp4,
+        alpha,
+    )

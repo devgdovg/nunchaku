@@ -5,7 +5,7 @@ Quantized linear layers for Nunchaku.
 import torch
 from torch import nn
 
-from ..ops.gemm import svdq_gemm_w4a4_cuda
+from ..ops.gemm import svdq_gemm_w4a4_cuda, svdq_gemm_w4a4_gated_residual_cuda
 from ..ops.gemv import awq_gemv_w4a16_cuda
 from ..ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
 
@@ -193,6 +193,64 @@ class SVDQW4A4Linear(nn.Module):
         output = self.forward_quant(quantized_x, ascales, lora_act_out, output)
         output = output.reshape(batch_size, seq_len, -1)
         return output
+
+    def forward_gated_residual(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        gate: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward with fused ``out = residual + linear(x) * gate``.
+
+        This is the MOSS Image o_proj Epilogue A1 path. ``residual`` is the
+        block input residual stream and has shape ``(B, S, out_features)``;
+        ``gate`` is a per-sample vector of ``out_features`` elements.
+        """
+        if self.precision != "nvfp4":
+            raise ValueError("gated residual fusion currently requires nvfp4")
+        if self.bias is not None:
+            raise ValueError("gated residual fusion currently expects a bias-free linear")
+        batch_size, seq_len, channels = x.shape
+        if residual.shape != (batch_size, seq_len, self.out_features):
+            raise ValueError(
+                f"residual must have shape {(batch_size, seq_len, self.out_features)}, "
+                f"got {tuple(residual.shape)}"
+            )
+        if gate.numel() != self.out_features:
+            raise ValueError(f"gate must contain {self.out_features} elements, got {gate.numel()}")
+
+        x = x.reshape(batch_size * seq_len, channels)
+        residual = residual.reshape(batch_size * seq_len, self.out_features)
+        gate = gate.reshape(-1)
+        if not x.is_contiguous():
+            x = x.contiguous()
+        if not residual.is_contiguous():
+            residual = residual.contiguous()
+        if not gate.is_contiguous():
+            gate = gate.contiguous()
+
+        if output is None:
+            output = torch.empty(
+                batch_size * seq_len, self.out_features, dtype=x.dtype, device=x.device
+            )
+
+        quantized_x, ascales, lora_act_out = self.quantize(x)
+        svdq_gemm_w4a4_gated_residual_cuda(
+            act=quantized_x,
+            wgt=self.qweight,
+            out=output,
+            ascales=ascales,
+            wscales=self.wscales,
+            lora_act_in=lora_act_out,
+            lora_up=self.proj_up,
+            wcscales=self.wcscales,
+            residual=residual,
+            gate=gate,
+            fp4=True,
+            alpha=self.wtscale,
+        )
+        return output.reshape(batch_size, seq_len, -1)
 
     def quantize(self, x: torch.Tensor, pad_size: int = 256) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """

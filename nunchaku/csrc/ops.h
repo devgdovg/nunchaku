@@ -82,6 +82,65 @@ void gemm_w4a4(std::optional<torch::Tensor> act,            // packed act [M, K 
     // Tensor::synchronizeDevice();
 }
 
+void gemm_w4a4_gated_residual(torch::Tensor act,
+                              torch::Tensor wgt,
+                              torch::Tensor out,
+                              torch::Tensor ascales,
+                              torch::Tensor wscales,
+                              torch::Tensor lora_act_in,
+                              torch::Tensor lora_up,
+                              torch::Tensor wcscales,
+                              torch::Tensor residual,
+                              torch::Tensor gate,
+                              bool fp4,
+                              float alpha) {
+    TorchOpContext ctx;
+    spdlog::trace("running gemm_w4a4_gated_residual: ");
+
+    TORCH_CHECK(fp4, "gated residual fusion currently requires NVFP4");
+    TORCH_CHECK(out.dim() == 2, "out must be [M, N]");
+    TORCH_CHECK(residual.numel() == out.numel(), "residual must match out shape");
+    TORCH_CHECK(gate.numel() == out.size(1), "gate must contain out_features elements");
+    TORCH_CHECK(residual.scalar_type() == out.scalar_type(), "residual dtype must match out");
+    TORCH_CHECK(gate.scalar_type() == out.scalar_type(), "gate dtype must match out");
+
+    const int rank = static_cast<int>(lora_up.size(1));
+    std::vector<float> lora_scales((rank + 15) / 16, 1.0f);
+
+    nunchaku::kernels::gemm_w4a4(from_torch(act),
+                                 from_torch(wgt),
+                                 from_torch(out),
+                                 {},
+                                 from_torch(ascales),
+                                 from_torch(wscales),
+                                 {},
+                                 {},
+                                 from_torch(lora_act_in),
+                                 from_torch(lora_up),
+                                 {},
+                                 {},
+                                 {},
+                                 {},
+                                 {},
+                                 {},
+                                 {},
+                                 {},
+                                 {},
+                                 false,
+                                 lora_scales,
+                                 false,
+                                 fp4,
+                                 alpha,
+                                 from_torch(wcscales),
+                                 {},
+                                 {},
+                                 {},
+                                 0,
+                                 0,
+                                 from_torch(residual),
+                                 from_torch(gate));
+}
+
 void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,
                                  std::optional<torch::Tensor> output,
                                  std::optional<torch::Tensor> oscales,

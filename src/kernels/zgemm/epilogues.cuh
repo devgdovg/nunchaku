@@ -19,6 +19,47 @@ public:
     IMPORT_GEMM_BASE(Config);
 
 public:
+    struct EpilogueGatedResidual {
+        struct Arguments {
+            const half_t *residual; // [M, N], row-major
+            const half_t *gate;     // [N]
+            half_t *out;            // [M, N], row-major
+            int actualM, actualN;
+        };
+
+        __device__ __forceinline__ void
+        operator()(const BlockInfo binfo, fpsum_warp &fpsum, int M, int N, int K, const Arguments &args) {
+            const int laneId = threadIdx.x % WARP_SIZE;
+            const int warpId = threadIdx.x / WARP_SIZE;
+
+            __shared__ alignas(128) uint8_t shmem[NUM_WARPS][ceilDiv(unpack_fpsum::SHMEM_SIZE, 128) * 128];
+
+            const int m_offset = binfo.bm * BLOCK_M + warpId * WARP_M;
+            const int n_offset = binfo.bn * BLOCK_N;
+
+            using pack_t = typename unpack_fpsum::pack_t;
+
+            unpack_fpsum()(fpsum,
+                           args.out + m_offset * args.actualN + n_offset,
+                           args.actualN,
+                           args.actualM - m_offset,
+                           args.actualN - n_offset,
+                           shmem[warpId],
+                           [&](int rowId, pack_t &pack) {
+                               const int row = m_offset + rowId;
+                               const int col = n_offset + laneId * unpack_fpsum::PACK_SIZE;
+                               if (row < args.actualM && col + unpack_fpsum::PACK_SIZE <= args.actualN) {
+                                   const half_t *residual = args.residual + row * args.actualN + col;
+                                   const half_t *gate     = args.gate + col;
+#pragma unroll
+                                   for (int i = 0; i < unpack_fpsum::PACK_SIZE; i++) {
+                                       pack[i] = half_t(float(pack[i]) + float(residual[i]) * float(gate[i]));
+                                   }
+                               }
+                           });
+        }
+    };
+
     struct EpilogueGelu {
         struct Arguments {
             size_t unused;

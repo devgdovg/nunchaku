@@ -34,7 +34,9 @@ void gemm_w4a4(Tensor act,            // packed act [M, K / 2]
                Tensor out_k, // packed attention [B, H, M, D]
                Tensor out_v, // packed attention [B, H, M, D]
                int attn_tokens,
-               int rope_mode = 0);
+               int rope_mode = 0,
+               Tensor residual = {}, // [M, N], for gated residual epilogue
+               Tensor gate = {});    // [N], for gated residual epilogue
 void linearattn_vk_mul_q(Tensor q, Tensor vk);
 
 void quantize_w4a4_act_fuse_lora(Tensor input,

@@ -347,7 +347,7 @@ class NunchakuMOSSImageBlock(nn.Module):
         y = y.to(dtype)
         q, k, v = self._qkv_fused(y, rope).chunk(3, -1)
         attn = _attention_pre_roped(q, k, v, self.heads)
-        x = x + self.proj["o"](attn) * gate_a[:, None]
+        x = self.proj["o"].forward_gated_residual(attn, residual=x, gate=gate_a)
         y = self.norm2(x) * (1 + scale_f[:, None]) + shift_f[:, None]
         hidden, gate = self.proj["ffn_up_gate"](y.to(dtype)).chunk(2, -1)
         return x + self.proj["ffn_down"](situ(hidden, gate)) * gate_f[:, None]

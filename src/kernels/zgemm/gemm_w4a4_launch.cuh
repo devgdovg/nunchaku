@@ -48,7 +48,9 @@ public:
                           Tensor out_k,    // packed attention [B, H, M, D]
                           Tensor out_v,    // packed attention [B, H, M, D]
                           int attn_tokens,
-                          int rope_mode = 0);
+                          int rope_mode = 0,
+                          Tensor residual = {}, // [M, N], for gated residual epilogue
+                          Tensor gate = {});    // [N], for gated residual epilogue
     static void quantize_w4a4_act_fuse_lora(Tensor input,
                                             Tensor output,
                                             Tensor oscales,
