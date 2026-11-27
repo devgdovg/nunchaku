@@ -25,6 +25,7 @@ from ...ops.gemm import svdq_gemm_w4a4_cuda
 from ...ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
 from ...utils import get_precision, pad_tensor
 from ..linear import SVDQW4A4Linear
+from ..mossimage.linear import MOSSImageW4A4OProject
 from ..utils import fuse_linears
 from .utils import NunchakuModelLoaderMixin, patch_scale_key
 
@@ -331,7 +332,7 @@ class NunchakuMOSSImageBlock(nn.Module):
         self.proj = nn.ModuleDict(
             {
                 "qkv": SVDQW4A4Linear.from_linear(qkv, precision=precision, rank=rank),
-                "o": SVDQW4A4Linear.from_linear(orig.proj["o"], precision=precision, rank=rank),
+                "o": MOSSImageW4A4OProject.from_linear(orig.proj["o"], precision=precision, rank=rank),
                 "ffn_up_gate": SVDQW4A4Linear.from_linear(orig.proj["ffn_up_gate"], precision=precision, rank=rank),
                 "ffn_down": SVDQW4A4Linear.from_linear(orig.proj["ffn_down"], precision=precision, rank=rank),
             }
@@ -347,7 +348,7 @@ class NunchakuMOSSImageBlock(nn.Module):
         y = y.to(dtype)
         q, k, v = self._qkv_fused(y, rope).chunk(3, -1)
         attn = _attention_pre_roped(q, k, v, self.heads)
-        x = self.proj["o"].forward_gated_residual(attn, residual=x, gate=gate_a)
+        x = self.proj["o"](attn, residual=x, gate=gate_a)
         y = self.norm2(x) * (1 + scale_f[:, None]) + shift_f[:, None]
         hidden, gate = self.proj["ffn_up_gate"](y.to(dtype)).chunk(2, -1)
         return x + self.proj["ffn_down"](situ(hidden, gate)) * gate_f[:, None]

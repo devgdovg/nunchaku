@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from nunchaku import NunchakuMOSSImageTransformer
+from nunchaku.models.linear import SVDQW4A4Linear
 from nunchaku.utils import get_precision
 
 ckpt_path = os.environ.get("MOSS_IMAGE_CKPT", "")
@@ -43,8 +44,8 @@ def test_o_proj_gated_residual_matches_eager():
     gate = torch.randn(1, 1, dim, device="cuda", dtype=torch.bfloat16)
 
     with torch.no_grad():
-        eager = residual + block.proj["o"](attn) * gate
-        fused = block.proj["o"].forward_gated_residual(attn, residual=residual, gate=gate)
+        eager = residual + SVDQW4A4Linear.forward(block.proj["o"], attn) * gate
+        fused = block.proj["o"](attn, residual=residual, gate=gate)
 
     diff = (fused.float() - eager.float()).abs()
     print(
