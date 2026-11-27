@@ -63,6 +63,8 @@ void gemm_w4a4(Tensor act,            // packed act [M, K / 2]
                int rope_mode,
                Tensor residual,
                Tensor gate) {
+    spdlog::info("A1 core: residual.valid={} gate.valid={} out.valid={}",
+                 residual.valid(), gate.valid(), out.valid());
     Tensor::ScalarType dtype = Tensor::INVALID_SCALAR_TYPE;
     if (!fp4) {
         dtype = ascales.dtype();

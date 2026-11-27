@@ -32,6 +32,14 @@ public:
             const int laneId = threadIdx.x % WARP_SIZE;
             const int warpId = threadIdx.x / WARP_SIZE;
 
+            if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
+                printf("A1 epi: actualM=%d actualN=%d residual0=%f gate0=%f\n",
+                       args.actualM,
+                       args.actualN,
+                       float(args.residual[0]),
+                       float(args.gate[0]));
+            }
+
             __shared__ alignas(128) uint8_t shmem[NUM_WARPS][ceilDiv(unpack_fpsum::SHMEM_SIZE, 128) * 128];
 
             const int m_offset = binfo.bm * BLOCK_M + warpId * WARP_M;
