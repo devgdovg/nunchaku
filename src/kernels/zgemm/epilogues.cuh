@@ -32,16 +32,6 @@ public:
             const int laneId = threadIdx.x % WARP_SIZE;
             const int warpId = threadIdx.x / WARP_SIZE;
 
-            if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
-                printf("A1 epi: actualM=%d actualN=%d residual0=%f gate0=%f gate1=%f res5_7=%f\n",
-                       args.actualM,
-                       args.actualN,
-                       float(args.residual[0]),
-                       float(args.gate[0]),
-                       float(args.gate[1]),
-                       args.actualM > 5 ? float(args.residual[5 * args.actualN + 7]) : -1.0f);
-            }
-
             __shared__ alignas(128) uint8_t shmem[NUM_WARPS][ceilDiv(unpack_fpsum::SHMEM_SIZE, 128) * 128];
 
             const int m_offset = binfo.bm * BLOCK_M + warpId * WARP_M;
@@ -63,14 +53,7 @@ public:
                                    const half_t *gate     = args.gate + col;
 #pragma unroll
                                    for (int i = 0; i < unpack_fpsum::PACK_SIZE; i++) {
-                                       pack[i] = half_t(float(pack[i]) + float(residual[i]) * float(gate[i]));
-                                   }
-                                   if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && rowId == 0) {
-                                       printf("A1 plugin: col=%d res=%f,%f,%f,%f gate=%f,%f,%f,%f pack=%f,%f,%f,%f\n",
-                                              col,
-                                              float(residual[0]), float(residual[1]), float(residual[2]), float(residual[3]),
-                                              float(gate[0]), float(gate[1]), float(gate[2]), float(gate[3]),
-                                              float(pack[0]), float(pack[1]), float(pack[2]), float(pack[3]));
+                                       pack[i] = half_t(float(residual[i]) + float(pack[i]) * float(gate[i]));
                                    }
                                }
                            });

@@ -95,8 +95,6 @@ void gemm_w4a4_gated_residual(torch::Tensor act,
                               bool fp4,
                               float alpha) {
     TorchOpContext ctx;
-    spdlog::info("A1 op: residual numel={} gate numel={} out numel={} fp4={}",
-                 residual.numel(), gate.numel(), out.numel(), fp4);
     spdlog::trace("running gemm_w4a4_gated_residual: ");
 
     TORCH_CHECK(fp4, "gated residual fusion currently requires NVFP4");

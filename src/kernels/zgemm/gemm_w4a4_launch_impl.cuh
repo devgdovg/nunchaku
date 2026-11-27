@@ -418,8 +418,6 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
 
     } else if (out.valid()) {
 
-        spdlog::info("A1 launch: out.valid=1 residual.valid={} gate.valid={}",
-                     residual.valid(), gate.valid());
         assert(residual.valid() == gate.valid());
 
         if (residual.valid()) {
