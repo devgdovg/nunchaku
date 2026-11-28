@@ -9,6 +9,9 @@ void silu(Tensor &out, // [..., d]
 void silu_and_mul(Tensor &out,    // [..., d]
                   Tensor &input); // [..., 2 * d]
 
+void situ_and_mul(Tensor &out,    // [..., d]
+                  Tensor &input); // [..., 2 * d]
+
 void gelu_new(Tensor &out, Tensor &input);
 
 void gelu_fast(Tensor &out, Tensor &input);

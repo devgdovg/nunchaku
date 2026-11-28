@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import torch
 
+from ...ops.activation import situ_and_mul_cuda
 from ...ops.gemm import svdq_gemm_w4a4_gated_residual_cuda
 from ..linear import SVDQW4A4Linear
 
-__all__ = ["MOSSImageW4A4OProject"]
+__all__ = ["MOSSImageW4A4FFNUpGateProject", "MOSSImageW4A4OProject"]
 
 
 class MOSSImageW4A4OProject(SVDQW4A4Linear):
@@ -82,3 +83,16 @@ class MOSSImageW4A4OProject(SVDQW4A4Linear):
             alpha=self.wtscale,
         )
         return output.reshape(batch_size, seq_len, -1)
+
+
+class MOSSImageW4A4FFNUpGateProject(SVDQW4A4Linear):
+    """SVDQ W4A4 ffn_up_gate with a fused situ output.
+
+    The underlying linear still produces ``[up, gate]``. The B0 kernel then
+    computes situ in one high-occupancy elementwise pass and returns
+    ``[B, S, ffn_dim]``.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        up_gate = super().forward(x)
+        return situ_and_mul_cuda(up_gate)

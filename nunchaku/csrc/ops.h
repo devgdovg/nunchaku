@@ -2,6 +2,7 @@
 
 #include "interop/torch.h"
 #include "kernels/zgemm/zgemm.h"
+#include "kernels/activation_kernels.h"
 #include "kernels/awq/gemv_awq.h"
 #include "kernels/awq/gemm_awq.h"
 
@@ -139,6 +140,19 @@ void gemm_w4a4_gated_residual(torch::Tensor act,
                                  0,
                                  from_torch(residual),
                                  from_torch(gate));
+}
+
+void situ_and_mul(torch::Tensor input, torch::Tensor output) {
+    TorchOpContext ctx;
+    TORCH_CHECK(input.dim() == 2, "input must be [M, 2 * D]");
+    TORCH_CHECK(output.dim() == 2, "output must be [M, D]");
+    TORCH_CHECK(input.size(1) % 2 == 0, "input last dimension must be even");
+    TORCH_CHECK(output.size(0) == input.size(0) && output.size(1) == input.size(1) / 2);
+    TORCH_CHECK(input.scalar_type() == output.scalar_type(), "input/output dtype mismatch");
+
+    Tensor in  = from_torch(input);
+    Tensor out = from_torch(output);
+    ::situ_and_mul(out, in);
 }
 
 void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,

@@ -73,6 +73,25 @@ void silu(Tensor &out,   // [..., d]
     LAUNCH_ACTIVATION_KERNEL(vllm::silu);
 }
 
+void situ_and_mul(Tensor &out,    // [..., d]
+                  Tensor &input) // [..., 2 * d]
+{
+    const int d = input.size(-1) / 2;
+    assert(d * 2 == input.size(-1));
+    assert(out.size(-1) == d);
+    assert(out.numel() == input.numel() / 2);
+
+    const int64_t num_tokens = input.numel() / input.size(-1);
+    dim3 grid(num_tokens);
+    dim3 block(std::min(d / 2, 1024));
+    const cudaStream_t stream = getCurrentCUDAStream();
+
+    VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "situ_and_mul_kernel", [&] {
+        vllm::situ_and_mul_kernel<scalar_t>
+            <<<grid, block, 0, stream>>>(out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), d);
+    });
+}
+
 void gelu_new(Tensor &out,   // [..., d]
               Tensor &input) // [..., d]
 {

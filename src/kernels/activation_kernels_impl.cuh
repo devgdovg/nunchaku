@@ -103,4 +103,65 @@ __device__ __forceinline__ T gelu_fast_kernel(const T &x) {
     return ((T)0.5) * x * (((T)1.0) + t);
 }
 
+template<typename T>
+struct SituVecTraits;
+
+template<>
+struct SituVecTraits<half> {
+    using vec_t = half2;
+    __device__ __forceinline__ static float2 to_float2(vec_t v) { return __half22float2(v); }
+    __device__ __forceinline__ static vec_t from_float2(float2 v) { return __floats2half2_rn(v.x, v.y); }
+};
+
+template<>
+struct SituVecTraits<__nv_bfloat16> {
+    using vec_t = __nv_bfloat162;
+    __device__ __forceinline__ static float2 to_float2(vec_t v) { return __bfloat1622float2(v); }
+    __device__ __forceinline__ static vec_t from_float2(float2 v) { return __floats2bfloat162_rn(v.x, v.y); }
+};
+
+template<>
+struct SituVecTraits<float> {
+    using vec_t = float2;
+    __device__ __forceinline__ static float2 to_float2(vec_t v) { return v; }
+    __device__ __forceinline__ static vec_t from_float2(float2 v) { return v; }
+};
+
+__device__ __forceinline__ float situ_tanh(float x) {
+    float result;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(result) : "f"(x));
+    return result;
+}
+
+__device__ __forceinline__ float situ_sigmoid(float x) {
+    return fmaf(0.5f, situ_tanh(0.5f * x), 0.5f);
+}
+
+__device__ __forceinline__ float2 situ_pair(float2 hidden, float2 gate) {
+    const float g0 = situ_tanh(gate.x * 0.25f) * situ_sigmoid(gate.x);
+    const float g1 = situ_tanh(gate.y * 0.25f) * situ_sigmoid(gate.y);
+    const float h0 = situ_tanh(hidden.x * 0.04f);
+    const float h1 = situ_tanh(hidden.y * 0.04f);
+    return make_float2((4.0f * g0) * (25.0f * h0), (4.0f * g1) * (25.0f * h1));
+}
+
+template<typename scalar_t>
+__global__ void situ_and_mul_kernel(scalar_t *__restrict__ out,         // [..., d]
+                                    const scalar_t *__restrict__ input, // [..., 2 * d]
+                                    const int d) {
+    using traits = SituVecTraits<scalar_t>;
+    using vec_t  = typename traits::vec_t;
+
+    const int token_idx = blockIdx.x;
+    const scalar_t *up  = input + int64_t(token_idx) * 2 * d;
+    const scalar_t *gate = up + d;
+    scalar_t *dst       = out + int64_t(token_idx) * d;
+
+    for (int idx = threadIdx.x * 2; idx < d; idx += blockDim.x * 2) {
+        const float2 hidden = traits::to_float2(*reinterpret_cast<const vec_t *>(up + idx));
+        const float2 gate_v = traits::to_float2(*reinterpret_cast<const vec_t *>(gate + idx));
+        *reinterpret_cast<vec_t *>(dst + idx) = traits::from_float2(situ_pair(hidden, gate_v));
+    }
+}
+
 } // namespace vllm
