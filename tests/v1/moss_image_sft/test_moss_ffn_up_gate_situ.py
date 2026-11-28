@@ -28,8 +28,11 @@ def test_ffn_up_gate_situ_matches_eager():
 
     seq_len = int(os.environ.get("MOSS_SITU_SEQ_LEN", "256"))
     bf16_eps = torch.finfo(torch.bfloat16).eps
+    # B0 uses tanh.approx and a single float->bf16 rounding, while the eager
+    # path rounds a chain of bf16 elementwise ops. Allow a few bf16 ULPs at
+    # large activations while still detecting structural errors.
     atol = float(os.environ.get("MOSS_SITU_ATOL", str(4 * bf16_eps)))
-    rtol = float(os.environ.get("MOSS_SITU_RTOL", str(2 * bf16_eps)))
+    rtol = float(os.environ.get("MOSS_SITU_RTOL", "0.025"))
 
     torch.manual_seed(0)
     transformer = NunchakuMOSSImageTransformer.from_pretrained(
